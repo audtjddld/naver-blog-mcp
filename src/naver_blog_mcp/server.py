@@ -21,6 +21,8 @@ from .mcp.tools import (
     handle_create_post,
     # handle_delete_post,  # 비활성화
     handle_list_categories,
+    handle_list_posts,
+    handle_read_post,
 )
 from .utils.trace_manager import trace_manager
 
@@ -86,6 +88,16 @@ class NaverBlogMCPServer:
                 #     )
                 elif name == "naver_blog_list_categories":
                     result = await handle_list_categories(page=page)
+                elif name == "naver_blog_list_posts":
+                    result = await handle_list_posts(
+                        page=page,
+                        category_no=arguments.get("category_no"),
+                    )
+                elif name == "naver_blog_read_post":
+                    result = await handle_read_post(
+                        page=page,
+                        log_no=arguments["log_no"],
+                    )
                 else:
                     return [
                         {

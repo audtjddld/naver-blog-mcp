@@ -63,6 +63,56 @@ class NaverSelectors:
         "delete_btn": ["a:has-text('삭제')", ".delete_btn"],
     }
 
+    # 글 목록 페이지
+    POST_LIST = {
+        "post_title_link": [
+            "a.pcol2",  # 일반 리스트 뷰
+            "a[href*='PostView']",
+            ".title a",
+            ".post-title a",
+        ],
+        "post_date": [
+            "td.date",  # 리스트 뷰 날짜 칼럼
+            "span.date",
+            ".post-date",
+        ],
+        "pagination_next": [
+            "a.next",
+            "a:has-text('다음')",
+        ],
+        "category_item": [
+            "a[href*='categoryNo=']",
+        ],
+    }
+
+    # 글 읽기 (본문 추출)
+    POST_READ = {
+        "post_title": [
+            ".se-module-text .se-text-paragraph",  # SmartEditor ONE
+            ".se-title-text",
+            "div.se-component.se-sticker .se-module-text",
+            ".pcol1",
+            "#title_1",
+        ],
+        "post_content": [
+            "div.se-main-container",  # SmartEditor ONE
+            "#postViewArea",  # 구 에디터
+            ".post-view",
+            "#post-view",
+        ],
+        "post_date": [
+            "span.se_publishDate",
+            ".blog_date",
+            "p.date",
+            ".se-date",
+        ],
+        "post_tags": [
+            ".post_tag a",
+            "a.tag",
+            ".wrap_tag a",
+        ],
+    }
+
     @classmethod
     def get_selector(cls, category: str, key: str) -> Selector:
         """

@@ -11,6 +11,7 @@ from playwright.async_api import Page
 from ..automation.post_actions import create_blog_post, NaverBlogPostError
 from ..automation.image_upload import upload_images
 from ..automation.category_actions import get_categories
+from ..automation.read_actions import list_posts, read_post
 from ..utils.retry import retry_on_error
 from ..utils.error_handler import handle_playwright_error
 from ..utils.exceptions import NaverBlogError, UploadError
@@ -77,6 +78,34 @@ TOOLS_METADATA = {
             "type": "object",
             "properties": {},
             "required": [],
+        },
+    },
+    "naver_blog_list_posts": {
+        "name": "naver_blog_list_posts",
+        "description": "네이버 블로그의 글 목록을 조회합니다. 카테고리별 필터링이 가능합니다.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "category_no": {
+                    "type": "string",
+                    "description": "카테고리 번호 (선택, 미지정시 전체 글 조회)",
+                },
+            },
+            "required": [],
+        },
+    },
+    "naver_blog_read_post": {
+        "name": "naver_blog_read_post",
+        "description": "네이버 블로그의 개별 글 본문을 읽습니다.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "log_no": {
+                    "type": "string",
+                    "description": "글 번호 (logNo)",
+                },
+            },
+            "required": ["log_no"],
         },
     },
 }
@@ -222,6 +251,80 @@ async def handle_create_post(
 #         "message": "글 삭제 기능은 아직 구현되지 않았습니다.",
 #         "post_url": post_url,
 #     }
+
+
+async def handle_list_posts(
+    page: Page,
+    category_no: Optional[str] = None,
+) -> Dict[str, Any]:
+    """네이버 블로그의 글 목록을 조회합니다.
+
+    Args:
+        page: Playwright Page 객체
+        category_no: 카테고리 번호 (선택)
+
+    Returns:
+        작업 결과 딕셔너리
+    """
+    logger.info(f"글 목록 조회 시작 (categoryNo={category_no})")
+
+    try:
+        result = await list_posts(page, category_no=category_no)
+
+        if result["success"]:
+            logger.info(f"글 목록 조회 완료: {len(result['posts'])}개")
+        else:
+            logger.error(f"글 목록 조회 실패: {result['message']}")
+
+        return result
+
+    except Exception as e:
+        logger.error(f"글 목록 조회 중 예외 발생: {e}", exc_info=True)
+        return {
+            "success": False,
+            "message": f"글 목록 조회 실패: {str(e)}",
+            "posts": [],
+        }
+
+
+async def handle_read_post(
+    page: Page,
+    log_no: str,
+) -> Dict[str, Any]:
+    """네이버 블로그의 개별 글 본문을 읽습니다.
+
+    Args:
+        page: Playwright Page 객체
+        log_no: 글 번호
+
+    Returns:
+        작업 결과 딕셔너리
+    """
+    logger.info(f"글 읽기 시작: logNo={log_no}")
+
+    try:
+        result = await read_post(page, log_no=log_no)
+
+        if result["success"]:
+            logger.info(f"글 읽기 완료: {result['title']}")
+        else:
+            logger.error(f"글 읽기 실패: {result['message']}")
+
+        return result
+
+    except Exception as e:
+        logger.error(f"글 읽기 중 예외 발생: {e}", exc_info=True)
+        return {
+            "success": False,
+            "message": f"글 읽기 실패: {str(e)}",
+            "title": "",
+            "date": "",
+            "categoryName": "",
+            "content_html": "",
+            "content_text": "",
+            "tags": [],
+            "images": [],
+        }
 
 
 async def handle_list_categories(page: Page) -> Dict[str, Any]:

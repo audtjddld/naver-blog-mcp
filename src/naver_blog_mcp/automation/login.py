@@ -94,7 +94,7 @@ async def login_to_naver(
         # 5. 로그인 완료 대기 (네이버 메인 페이지 또는 에러 메시지)
         try:
             # 로그인 성공 시 네이버 메인으로 리다이렉트
-            await page.wait_for_url("**/naver.com**", timeout=10000)
+            await page.wait_for_url("**/naver.com**", timeout=120000)
         except PlaywrightTimeout:
             # 로그인 페이지에 머물러 있으면 에러 확인
             current_url = page.url
@@ -111,7 +111,7 @@ async def login_to_naver(
                         )
 
                 # 에러 메시지 확인 (여러 개가 있을 수 있으므로 first() 사용)
-                error_msg_element = page.locator(".error_message").first()
+                error_msg_element = page.locator(".error_message").first
                 error_msg_count = await page.locator(".error_message:visible").count()
                 if error_msg_count > 0:
                     error_msg = await error_msg_element.text_content()

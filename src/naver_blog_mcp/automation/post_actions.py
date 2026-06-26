@@ -415,12 +415,15 @@ async def _select_category(page: Page, category: str) -> bool:
 
 async def _select_visibility(page: Page, visibility: str) -> bool:
     """발행 설정 레이어에서 공개범위를 선택한다(전체공개/이웃공개/서로이웃공개/비공개)."""
+    # 정확 텍스트 매칭(:text-is)만 사용한다. 부분 매칭(:has-text)은 '비공개'가 포함된
+    # 다른 요소를 잘못 클릭해 실제로는 공개범위가 안 바뀌었는데 성공으로 오인 →
+    # 의도치 않은 전체공개 발행으로 이어질 수 있어 위험하다.
     for frame in page.frames:
         try:
             sels = [
-                f"label:has-text('{visibility}'):visible",
-                f"span:has-text('{visibility}'):visible",
-                f"button:has-text('{visibility}'):visible",
+                f"label:text-is('{visibility}'):visible",
+                f"span:text-is('{visibility}'):visible",
+                f"button:text-is('{visibility}'):visible",
             ]
             for sel in sels:
                 loc = frame.locator(sel)
@@ -431,7 +434,7 @@ async def _select_visibility(page: Page, visibility: str) -> bool:
                     return True
         except Exception:
             continue
-    logger.warning(f"공개범위 '{visibility}' 설정 실패(요소 미발견).")
+    logger.warning(f"공개범위 '{visibility}' 설정 실패(정확 매칭 요소 미발견).")
     return False
 
 

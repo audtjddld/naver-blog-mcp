@@ -94,7 +94,7 @@ class NaverBlogMCPServer:
                 # 2) 로그인 확인 및 세션 저장
                 if name == "naver_blog_confirm_login":
                     result = await handle_confirm_login(
-                        page, self.context, config.SESSION_STORAGE_PATH
+                        page, self.context, self.session_manager.storage_path
                     )
                     return _text(result)
 
@@ -194,6 +194,7 @@ class NaverBlogMCPServer:
 
         # 저장된 세션이 유효하면 재사용
         if self.session_manager.is_session_file_valid():
+            ctx = None
             try:
                 ctx = await self.browser.new_context(
                     storage_state=self.session_manager.storage_path
@@ -205,6 +206,11 @@ class NaverBlogMCPServer:
                 await ctx.close()
                 logger.info("저장된 세션이 만료됨. 미로그인 컨텍스트로 시작.")
             except Exception as e:
+                if ctx is not None:
+                    try:
+                        await ctx.close()
+                    except Exception:
+                        pass
                 logger.warning(f"세션 복원 실패: {e}. 미로그인 컨텍스트로 시작.")
 
         # 빈 컨텍스트 (미로그인)

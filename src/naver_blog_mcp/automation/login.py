@@ -1,12 +1,15 @@
 """네이버 로그인 자동화."""
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Optional
 
 from playwright.async_api import Page, BrowserContext, TimeoutError as PlaywrightTimeout
 
 from .selectors import LOGIN_ID_INPUT, LOGIN_PW_INPUT, LOGIN_BTN
+
+logger = logging.getLogger(__name__)
 
 
 class NaverLoginError(Exception):
@@ -25,6 +28,53 @@ class InvalidCredentialsError(NaverLoginError):
     """잘못된 로그인 정보."""
 
     pass
+
+
+async def start_login(page: Page, user_id: str, password: str) -> None:
+    """네이버 로그인 페이지에서 ID/PW 제출까지만 수행한다(논블로킹).
+
+    로그인 클릭 후의 리다이렉트/2차 인증 대기는 하지 않는다. 2차 인증·CAPTCHA는
+    사용자가 헤드풀 브라우저에서 직접 완료하고, 이후 verify_login_session 또는
+    naver_blog_confirm_login 으로 로그인 여부를 확인한다.
+
+    Args:
+        page: Playwright Page 객체 (headed 권장)
+        user_id: 네이버 아이디
+        password: 네이버 비밀번호
+
+    Raises:
+        NaverLoginError: 로그인 페이지/버튼 처리 실패 시
+    """
+    try:
+        await page.goto("https://nid.naver.com/nidlogin.login", wait_until="networkidle")
+        await asyncio.sleep(1)
+
+        await page.fill(LOGIN_ID_INPUT, user_id)
+        await asyncio.sleep(0.5)
+        await page.fill(LOGIN_PW_INPUT, password)
+        await asyncio.sleep(0.5)
+
+        login_clicked = False
+        if isinstance(LOGIN_BTN, list):
+            for selector in LOGIN_BTN:
+                try:
+                    await page.click(selector, timeout=3000)
+                    login_clicked = True
+                    break
+                except PlaywrightTimeout:
+                    continue
+        else:
+            await page.click(LOGIN_BTN)
+            login_clicked = True
+
+        if not login_clicked:
+            raise NaverLoginError("로그인 버튼을 찾을 수 없습니다.")
+
+        logger.info("로그인 정보 제출 완료. 2차 인증/CAPTCHA는 사용자 확인 대기.")
+    except NaverLoginError:
+        raise
+    except Exception as e:
+        raise NaverLoginError(f"로그인 시작 중 오류 발생: {str(e)}")
 
 
 async def login_to_naver(

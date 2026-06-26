@@ -16,6 +16,7 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 from .config import get_browser_config, config
 from .services.session_manager import SessionManager
+from .automation.login import verify_login_session
 from .mcp.tools import (
     TOOLS_METADATA,
     handle_create_post,
@@ -23,6 +24,8 @@ from .mcp.tools import (
     handle_list_categories,
     handle_list_posts,
     handle_read_post,
+    handle_login,
+    handle_confirm_login,
 )
 from .utils.trace_manager import trace_manager
 
@@ -63,13 +66,48 @@ class NaverBlogMCPServer:
             """Tool 호출 핸들러."""
             logger.info(f"Tool called: {name} with arguments: {arguments}")
 
+            import json
+
+            def _text(payload) -> list[dict]:
+                if isinstance(payload, str):
+                    return [{"type": "text", "text": payload}]
+                return [
+                    {"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)}
+                ]
+
             try:
+                # 1) 로그인 시작: 기존 창을 닫고 새 headed 창에서 로그인 (2차 인증 수동)
+                if name == "naver_blog_login":
+                    await self.reset_browser_for_login()
+                    page = await self.get_page()
+                    result = await handle_login(
+                        page,
+                        config.NAVER_BLOG_ID,
+                        config.NAVER_BLOG_PASSWORD,
+                    )
+                    return _text(result)
+
+                # 그 외 도구는 브라우저만 보장 (대화형 로그인은 하지 않음)
+                await self.ensure_browser()
+                page = await self.get_page()
+
+                # 2) 로그인 확인 및 세션 저장
+                if name == "naver_blog_confirm_login":
+                    result = await handle_confirm_login(
+                        page, self.context, config.SESSION_STORAGE_PATH
+                    )
+                    return _text(result)
+
+                # 3) 콘텐츠 도구: 로그인 가드 (미로그인 시 안내만, 블로킹 금지)
+                if not await verify_login_session(page):
+                    return _text(
+                        "네이버 로그인이 필요합니다. 먼저 naver_blog_login을 실행하고, "
+                        "브라우저에서 2차 인증을 완료한 뒤 naver_blog_confirm_login으로 확인하세요."
+                    )
+
                 # Trace 시작
                 if self.context:
                     await trace_manager.start_trace(self.context, name=name)
-
-                # 페이지 가져오기
-                page = await self.get_page()
 
                 # Tool별 핸들러 호출
                 if name == "naver_blog_create_post":
@@ -99,40 +137,25 @@ class NaverBlogMCPServer:
                         log_no=arguments["log_no"],
                     )
                 else:
-                    return [
-                        {
-                            "type": "text",
-                            "text": f"알 수 없는 Tool: {name}",
-                        }
-                    ]
+                    return _text(f"알 수 없는 Tool: {name}")
 
                 # Trace 저장 (성공)
                 if self.context:
                     await trace_manager.stop_trace(self.context, success=True)
 
-                # 결과를 MCP 형식으로 변환
-                import json
-
-                return [
-                    {
-                        "type": "text",
-                        "text": json.dumps(result, ensure_ascii=False, indent=2),
-                    }
-                ]
+                return _text(result)
 
             except Exception as e:
                 logger.error(f"Tool execution error: {e}", exc_info=True)
 
                 # Trace 저장 (실패)
                 if self.context:
-                    await trace_manager.stop_trace(self.context, success=False)
+                    try:
+                        await trace_manager.stop_trace(self.context, success=False)
+                    except Exception:
+                        pass
 
-                return [
-                    {
-                        "type": "text",
-                        "text": f"오류 발생: {str(e)}",
-                    }
-                ]
+                return _text(f"오류 발생: {str(e)}")
 
         # list_tools 핸들러 등록
         @self.server.list_tools()
@@ -150,23 +173,73 @@ class NaverBlogMCPServer:
 
         logger.info(f"Registered {len(TOOLS_METADATA)} tools")
 
-    async def initialize(self):
-        """브라우저 및 세션 초기화."""
-        logger.info("Initializing Naver Blog MCP Server...")
+    async def ensure_browser(self):
+        """브라우저/컨텍스트를 보장한다(lazy). 대화형 로그인은 하지 않는다.
 
-        # Playwright 시작
-        self.playwright = await async_playwright().start()
+        저장된 세션이 유효하면 재사용하고, 없으면 빈 컨텍스트(미로그인)를 만든다.
+        실제 로그인은 naver_blog_login 도구에서만 수행한다.
+        """
+        if self.context:
+            return
 
-        # 브라우저 설정 가져오기
+        if self.playwright is None:
+            self.playwright = await async_playwright().start()
+
+        if self.browser is None:
+            browser_config = get_browser_config()
+            self.browser = await self.playwright.chromium.launch(**browser_config)
+            logger.info(
+                f"Browser launched (headless={browser_config.get('headless', True)})"
+            )
+
+        # 저장된 세션이 유효하면 재사용
+        if self.session_manager.is_session_file_valid():
+            try:
+                ctx = await self.browser.new_context(
+                    storage_state=self.session_manager.storage_path
+                )
+                if await self.session_manager.is_session_valid(ctx):
+                    self.context = ctx
+                    logger.info("저장된 세션 재사용")
+                    return
+                await ctx.close()
+                logger.info("저장된 세션이 만료됨. 미로그인 컨텍스트로 시작.")
+            except Exception as e:
+                logger.warning(f"세션 복원 실패: {e}. 미로그인 컨텍스트로 시작.")
+
+        # 빈 컨텍스트 (미로그인)
+        self.context = await self.browser.new_context()
+        logger.info("빈 컨텍스트 생성 (미로그인)")
+
+    async def reset_browser_for_login(self):
+        """기존 창을 닫고 headed 새 브라우저/컨텍스트를 연다(로그인 준비).
+
+        2차 인증 입력이 지연되어 기존 창이 stale 해진 경우에도, naver_blog_login을
+        다시 호출하면 항상 깨끗한 새 로그인 창에서 시작하도록 한다.
+        """
+        # 기존 컨텍스트/브라우저 정리
+        if self.context:
+            try:
+                await self.context.close()
+            except Exception:
+                pass
+            self.context = None
+        if self.browser:
+            try:
+                await self.browser.close()
+            except Exception:
+                pass
+            self.browser = None
+
+        if self.playwright is None:
+            self.playwright = await async_playwright().start()
+
+        # 2차 인증/CAPTCHA 수동 처리를 위해 headed 강제
         browser_config = get_browser_config()
-
-        # 브라우저 실행
+        browser_config["headless"] = False
         self.browser = await self.playwright.chromium.launch(**browser_config)
-        logger.info(f"Browser launched (headless={browser_config.get('headless', True)})")
-
-        # 세션 복원 또는 새 컨텍스트 생성
-        self.context = await self.session_manager.get_or_create_session(self.browser)
-        logger.info("Browser context initialized")
+        self.context = await self.browser.new_context()
+        logger.info("로그인용 새 headed 브라우저/컨텍스트 생성")
 
     async def cleanup(self):
         """리소스 정리."""
@@ -190,11 +263,9 @@ class NaverBlogMCPServer:
         Returns:
             Playwright Page 객체
 
-        Raises:
-            RuntimeError: 브라우저 컨텍스트가 초기화되지 않은 경우
         """
-        if not self.context:
-            raise RuntimeError("Browser context not initialized. Call initialize() first.")
+        # 브라우저/컨텍스트 보장 (lazy)
+        await self.ensure_browser()
 
         # 기존 페이지가 있으면 재사용, 없으면 새로 생성
         pages = self.context.pages
@@ -206,12 +277,12 @@ class NaverBlogMCPServer:
     async def run(self):
         """MCP 서버 실행."""
         try:
-            # 브라우저 초기화
-            await self.initialize()
+            # 브라우저는 lazy 초기화 (첫 도구 호출 시 ensure_browser).
+            # startup에서 로그인/브라우저를 띄우면 MCP 핸드셰이크가 막혀 연결 실패하므로 제거.
 
             # stdio를 통해 MCP 서버 실행
             async with stdio_server() as (read_stream, write_stream):
-                logger.info("MCP Server started successfully")
+                logger.info("MCP Server started successfully (lazy browser init)")
                 await self.server.run(
                     read_stream,
                     write_stream,

@@ -8,10 +8,13 @@ from typing import Optional, Dict, Any
 
 from playwright.async_api import Page
 
+from pathlib import Path
+
 from ..automation.post_actions import create_blog_post, NaverBlogPostError
 from ..automation.image_upload import upload_images
 from ..automation.category_actions import get_categories
 from ..automation.read_actions import list_posts, read_post
+from ..automation.login import start_login, verify_login_session
 from ..utils.retry import retry_on_error
 from ..utils.error_handler import handle_playwright_error
 from ..utils.exceptions import NaverBlogError, UploadError
@@ -19,6 +22,31 @@ from ..utils.exceptions import NaverBlogError, UploadError
 logger = logging.getLogger(__name__)
 
 TOOLS_METADATA = {
+    "naver_blog_login": {
+        "name": "naver_blog_login",
+        "description": (
+            "네이버 로그인을 시작합니다. 기존 창을 닫고 새 브라우저 창을 열어 ID/PW를 제출합니다. "
+            "2차 인증/CAPTCHA가 있으면 사용자가 브라우저에서 직접 완료해야 합니다. "
+            "완료 여부를 사용자에게 물어본 뒤 naver_blog_confirm_login으로 확인하세요."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    "naver_blog_confirm_login": {
+        "name": "naver_blog_confirm_login",
+        "description": (
+            "사용자가 2차 인증까지 로그인을 완료했는지 확인하고, 성공 시 세션을 저장합니다. "
+            "사용자가 '로그인 완료/네'라고 답한 뒤 호출하세요."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
     "naver_blog_create_post": {
         "name": "naver_blog_create_post",
         "description": "네이버 블로그에 새 글을 작성합니다. 이미지 첨부도 지원합니다.",
@@ -123,6 +151,82 @@ def get_tools_list() -> list[dict]:
 # ============================================================================
 # Tool Handler Functions
 # ============================================================================
+
+
+async def handle_login(page: Page, user_id: str, password: str) -> Dict[str, Any]:
+    """네이버 로그인을 시작합니다(ID/PW 제출까지, 논블로킹).
+
+    2차 인증/CAPTCHA는 사용자가 헤드풀 브라우저에서 직접 완료해야 하며,
+    완료 후 handle_confirm_login으로 확인한다.
+
+    Args:
+        page: Playwright Page (headed, 새로 연 로그인 창)
+        user_id: 네이버 아이디
+        password: 네이버 비밀번호
+
+    Returns:
+        작업 결과 딕셔너리
+    """
+    logger.info("네이버 로그인 시작")
+    try:
+        await start_login(page, user_id, password)
+        return {
+            "success": True,
+            "status": "login_started",
+            "message": (
+                "새 로그인 창에서 아이디/비밀번호를 제출했습니다. "
+                "브라우저 창에서 2차 인증 또는 CAPTCHA가 있으면 완료해 주세요. "
+                "완료되면 '네/완료'라고 알려주시면 naver_blog_confirm_login으로 확인합니다."
+            ),
+        }
+    except Exception as e:
+        logger.error(f"로그인 시작 실패: {e}", exc_info=True)
+        return {
+            "success": False,
+            "status": "login_error",
+            "message": f"로그인 시작 실패: {str(e)}",
+        }
+
+
+async def handle_confirm_login(page: Page, context, storage_path: str) -> Dict[str, Any]:
+    """로그인(2차 인증 포함) 완료 여부를 확인하고, 성공 시 세션을 저장합니다.
+
+    Args:
+        page: Playwright Page
+        context: Playwright BrowserContext (세션 저장 대상)
+        storage_path: 세션 저장 경로
+
+    Returns:
+        작업 결과 딕셔너리
+    """
+    logger.info("로그인 확인 시작")
+    try:
+        logged_in = await verify_login_session(page)
+        if not logged_in:
+            return {
+                "success": False,
+                "logged_in": False,
+                "message": (
+                    "아직 로그인 상태가 아닙니다. 브라우저 창에서 로그인/2차 인증을 "
+                    "완료한 뒤 다시 확인을 요청해 주세요."
+                ),
+            }
+
+        Path(storage_path).parent.mkdir(parents=True, exist_ok=True)
+        await context.storage_state(path=storage_path)
+        logger.info(f"세션 저장 완료: {storage_path}")
+        return {
+            "success": True,
+            "logged_in": True,
+            "message": "로그인 확인 완료. 세션을 저장했습니다. 이제 글쓰기/조회 기능을 사용할 수 있습니다.",
+        }
+    except Exception as e:
+        logger.error(f"로그인 확인 중 오류: {e}", exc_info=True)
+        return {
+            "success": False,
+            "logged_in": False,
+            "message": f"로그인 확인 중 오류: {str(e)}",
+        }
 
 
 @retry_on_error

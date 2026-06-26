@@ -330,8 +330,117 @@ async def fill_post_content(page: Page, content: str, use_html: bool = False) ->
         raise NaverBlogPostError(f"본문 입력 중 오류: {str(e)}")
 
 
+async def save_draft(page: Page) -> Dict[str, Any]:
+    """현재 작성 중인 글을 임시저장(저장)한다.
+
+    발행하지 않고 에디터의 '저장' 버튼을 눌러 임시저장 보관함에 저장한다.
+
+    Returns:
+        {"success": bool, "message": str, "post_url": None}
+    """
+    try:
+        await page.bring_to_front()
+        await asyncio.sleep(1)
+
+        saved = False
+        for frame in page.frames:
+            try:
+                candidates = [
+                    "button.save_btn__bzc5B",
+                    "button:has-text('저장'):visible",
+                    "a:has-text('저장'):visible",
+                ]
+                for sel in candidates:
+                    if await frame.locator(sel).count() > 0:
+                        await frame.locator(sel).first.click(timeout=5000)
+                        saved = True
+                        logger.info(f"임시저장 버튼 클릭: {sel}")
+                        break
+                if saved:
+                    break
+            except Exception:
+                continue
+
+        if not saved:
+            await page.screenshot(path="playwright-state/error_save_draft.png")
+            raise NaverBlogPostError("임시저장(저장) 버튼을 찾을 수 없습니다.")
+
+        await asyncio.sleep(2)
+        return {
+            "success": True,
+            "message": "임시저장되었습니다. (발행되지 않음)",
+            "post_url": None,
+        }
+    except NaverBlogPostError:
+        raise
+    except Exception as e:
+        raise NaverBlogPostError(f"임시저장 중 오류: {str(e)}")
+
+
+async def _select_category(page: Page, category: str) -> bool:
+    """발행 설정 레이어에서 카테고리를 선택한다(best-effort, 실패해도 발행 진행)."""
+    for frame in page.frames:
+        try:
+            # 카테고리 셀렉트박스 열기
+            openers = [
+                "button[class*='selectbox_button']",
+                "button:has-text('카테고리')",
+                ".selectbox_button",
+            ]
+            for sel in openers:
+                if await frame.locator(sel).count() > 0:
+                    try:
+                        await frame.locator(sel).first.click(timeout=3000)
+                        await asyncio.sleep(0.5)
+                    except Exception:
+                        pass
+                    break
+
+            # 카테고리 항목 선택 (이름 매칭)
+            item = frame.locator(
+                f"label:has-text('{category}'):visible, "
+                f"span:has-text('{category}'):visible, "
+                f"a:has-text('{category}'):visible"
+            )
+            if await item.count() > 0:
+                await item.first.click(timeout=3000)
+                await asyncio.sleep(0.5)
+                logger.info(f"카테고리 설정: {category}")
+                return True
+        except Exception:
+            continue
+    logger.warning(f"카테고리 '{category}' 설정 실패(요소 미발견). 기본 카테고리로 진행.")
+    return False
+
+
+async def _select_visibility(page: Page, visibility: str) -> bool:
+    """발행 설정 레이어에서 공개범위를 선택한다(전체공개/이웃공개/서로이웃공개/비공개)."""
+    for frame in page.frames:
+        try:
+            sels = [
+                f"label:has-text('{visibility}'):visible",
+                f"span:has-text('{visibility}'):visible",
+                f"button:has-text('{visibility}'):visible",
+            ]
+            for sel in sels:
+                loc = frame.locator(sel)
+                if await loc.count() > 0:
+                    await loc.first.click(timeout=3000)
+                    await asyncio.sleep(0.5)
+                    logger.info(f"공개범위 설정: {visibility}")
+                    return True
+        except Exception:
+            continue
+    logger.warning(f"공개범위 '{visibility}' 설정 실패(요소 미발견).")
+    return False
+
+
 async def publish_post(
-    page: Page, wait_for_completion: bool = True, timeout: int = 30000
+    page: Page,
+    wait_for_completion: bool = True,
+    timeout: int = 30000,
+    category: Optional[str] = None,
+    visibility: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     블로그 글을 발행합니다.
@@ -450,11 +559,28 @@ async def publish_post(
             await page.screenshot(path="playwright-state/error_publish_btn.png")
             raise NaverBlogPostError("발행 버튼을 찾을 수 없습니다.")
 
-        # 2. 발행 설정 대화상자에서 최종 "발행" 버튼 클릭
+        # 2. 발행 설정(카테고리/공개범위) 적용
+        if publish_clicked:
+            await asyncio.sleep(1)  # 대화상자 로딩 대기
+
+            # 카테고리: best-effort (실패 시 기본 카테고리로 진행)
+            if category:
+                await _select_category(page, category)
+
+            # 공개범위: 비공개/이웃공개 등을 요청했는데 설정에 실패하면,
+            # 의도치 않은 '전체공개' 발행을 막기 위해 발행을 중단한다.
+            if visibility:
+                vis_ok = await _select_visibility(page, visibility)
+                if not vis_ok and visibility != "전체공개":
+                    await page.screenshot(path="playwright-state/error_visibility.png")
+                    raise NaverBlogPostError(
+                        f"공개범위 '{visibility}' 설정에 실패하여 발행을 중단했습니다. "
+                        "(의도치 않은 전체공개 방지 — 셀렉터 튜닝 필요)"
+                    )
+
+        # 3. 발행 설정 대화상자에서 최종 "발행" 버튼 클릭
         if publish_clicked:
             try:
-                await asyncio.sleep(1)  # 대화상자 로딩 대기
-
                 # 대화상자 내 발행 버튼을 force=True로 클릭 시도
                 final_publish_clicked = False
                 for idx, frame in enumerate(page.frames):
@@ -549,6 +675,9 @@ async def create_blog_post(
     blog_id: Optional[str] = None,
     use_html: bool = False,
     wait_for_completion: bool = True,
+    category: Optional[str] = None,
+    visibility: Optional[str] = None,
+    draft: bool = False,
 ) -> Dict[str, Any]:
     """
     네이버 블로그에 새 글을 작성하고 발행하는 전체 프로세스.
@@ -583,8 +712,16 @@ async def create_blog_post(
         # 3. 본문 입력
         await fill_post_content(page, content, use_html)
 
-        # 4. 발행
-        result = await publish_post(page, wait_for_completion)
+        # 4. 임시저장 또는 발행
+        if draft:
+            result = await save_draft(page)
+        else:
+            result = await publish_post(
+                page,
+                wait_for_completion,
+                category=category,
+                visibility=visibility,
+            )
 
         result["title"] = title
         return result

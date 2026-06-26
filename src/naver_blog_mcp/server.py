@@ -118,7 +118,8 @@ class NaverBlogMCPServer:
                         category=arguments.get("category"),
                         tags=arguments.get("tags"),
                         images=arguments.get("images"),
-                        publish=arguments.get("publish", True),
+                        publish=arguments.get("publish", False),
+                        visibility=arguments.get("visibility", "비공개"),
                     )
                 # elif name == "naver_blog_delete_post":
                 #     result = await handle_delete_post(

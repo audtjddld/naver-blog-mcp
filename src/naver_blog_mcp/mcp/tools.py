@@ -77,8 +77,14 @@ TOOLS_METADATA = {
                 },
                 "publish": {
                     "type": "boolean",
-                    "description": "즉시 발행 여부 (기본: true, false면 임시저장)",
-                    "default": True,
+                    "description": "발행 여부. false면 임시저장(발행되지 않아 남에게 안 보임), true면 발행. 안전을 위해 기본값은 false(임시저장).",
+                    "default": False,
+                },
+                "visibility": {
+                    "type": "string",
+                    "enum": ["전체공개", "이웃공개", "서로이웃공개", "비공개"],
+                    "description": "발행 시 공개범위(publish=true일 때만 적용). 기본값은 비공개. 전체공개로 올리려면 명시적으로 '전체공개'를 지정해야 함.",
+                    "default": "비공개",
                 },
             },
             "required": ["title", "content"],
@@ -237,7 +243,8 @@ async def handle_create_post(
     category: Optional[str] = None,
     tags: Optional[list[str]] = None,
     images: Optional[list[str]] = None,
-    publish: bool = True,
+    publish: bool = False,
+    visibility: Optional[str] = "비공개",
 ) -> Dict[str, Any]:
     """네이버 블로그에 새 글을 작성합니다.
 
@@ -290,14 +297,17 @@ async def handle_create_post(
                     "images_uploaded": 0,
                 }
 
-        # 2. 본문 작성
+        # 2. 본문 작성 (publish=false면 임시저장, true면 지정 공개범위로 발행)
         result = await create_blog_post(
             page=page,
             title=title,
             content=content,
             blog_id=None,  # 현재 로그인된 블로그 사용
             use_html=False,
-            wait_for_completion=publish,
+            wait_for_completion=True,
+            category=category,
+            visibility=visibility,
+            draft=(not publish),
         )
 
         # 결과에 이미지 정보 추가

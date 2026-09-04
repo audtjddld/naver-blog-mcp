@@ -203,21 +203,41 @@ def _squash(text: str) -> str:
     return "".join(text.split())
 
 
-async def _clear_editor(page: Page) -> None:
-    """폴백 입력 전에 편집기를 비웁니다. 부분 붙여넣기가 남으면 본문이 중복됩니다."""
+async def _clear_editor(page: Page, target: Any) -> bool:
+    """편집기를 비우고 실제로 비었는지 확인합니다.
+
+    잔여 텍스트가 남으면 이후 입력이 그 위에 덧붙어 본문이 중복되므로,
+    비웠다고 확인되지 않으면 False를 반환합니다.
+    """
     try:
         await page.keyboard.press("ControlOrMeta+A")
         await page.keyboard.press("Delete")
+        await asyncio.sleep(0.2)
+        return _squash(await target.inner_text()) == ""
     except Exception as e:
-        logger.warning(f"편집기 초기화 실패 (무시): {e}")
+        logger.warning(f"편집기 초기화 실패: {e}")
+        return False
 
 
 async def _paste_content(page: Page, content: str, target: Any) -> bool:
     """포커스된 편집기에 본문 전체를 한 번에 붙여넣습니다.
 
     키 입력이 성공해도 편집기가 붙여넣기를 반영했다는 보장이 없으므로,
-    반영 여부를 읽어서 확인한 뒤에만 True를 반환합니다.
+    빈 편집기에서 시작해 반영 여부를 읽어서 확인한 뒤에만 True를 반환합니다.
+
+    Returns:
+        True면 붙여넣기가 반영됨. False면 편집기가 비어 있음이 확인된 상태이므로
+        호출자가 안전하게 키보드 입력으로 폴백할 수 있습니다.
+
+    Raises:
+        NaverBlogPostError: 편집기를 비웠는지 확인할 수 없어 폴백도 안전하지 않을 때.
+            조용히 본문이 중복되거나 누락되는 것보다 실패를 드러냅니다.
     """
+    # 잔여 텍스트가 있으면 꼬리 비교가 이전 내용에 매칭돼 오판한다.
+    # 같은 본문을 재시도하는 경우가 특히 위험하다.
+    if not await _clear_editor(page, target):
+        raise NaverBlogPostError("본문 입력 전 편집기를 비우지 못했습니다.")
+
     try:
         await page.context.grant_permissions(["clipboard-read", "clipboard-write"])
         await page.evaluate(
@@ -225,17 +245,19 @@ async def _paste_content(page: Page, content: str, target: Any) -> bool:
         )
         await page.keyboard.press("ControlOrMeta+V")
         await asyncio.sleep(0.5)
-
-        expected_tail = _squash(content)[-40:]
-        if expected_tail and expected_tail not in _squash(await target.inner_text()):
-            logger.warning("클립보드 붙여넣기가 반영되지 않음, 키보드 입력으로 대체")
-            await _clear_editor(page)
-            return False
-        return True
+        pasted = _squash(await target.inner_text())
     except Exception as e:
         logger.warning(f"클립보드 붙여넣기 실패, 키보드 입력으로 대체: {e}")
-        await _clear_editor(page)
-        return False
+        pasted = None
+
+    expected = _squash(content)
+    if pasted is not None and (pasted == expected or (expected and expected[-40:] in pasted)):
+        return True
+
+    logger.warning("클립보드 붙여넣기가 반영되지 않음, 키보드 입력으로 대체")
+    if not await _clear_editor(page, target):
+        raise NaverBlogPostError("붙여넣기 실패 후 편집기를 비우지 못했습니다.")
+    return False
 
 
 async def fill_post_content(page: Page, content: str, use_html: bool = False) -> None:

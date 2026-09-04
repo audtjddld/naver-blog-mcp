@@ -198,6 +198,46 @@ async def fill_post_title(page: Page, title: str) -> None:
         raise NaverBlogPostError(f"제목 입력 중 오류: {str(e)}")
 
 
+def _squash(text: str) -> str:
+    """공백을 모두 제거합니다. 편집기가 단락을 나눠도 비교가 되도록."""
+    return "".join(text.split())
+
+
+async def _clear_editor(page: Page) -> None:
+    """폴백 입력 전에 편집기를 비웁니다. 부분 붙여넣기가 남으면 본문이 중복됩니다."""
+    try:
+        await page.keyboard.press("ControlOrMeta+A")
+        await page.keyboard.press("Delete")
+    except Exception as e:
+        logger.warning(f"편집기 초기화 실패 (무시): {e}")
+
+
+async def _paste_content(page: Page, content: str, target: Any) -> bool:
+    """포커스된 편집기에 본문 전체를 한 번에 붙여넣습니다.
+
+    키 입력이 성공해도 편집기가 붙여넣기를 반영했다는 보장이 없으므로,
+    반영 여부를 읽어서 확인한 뒤에만 True를 반환합니다.
+    """
+    try:
+        await page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+        await page.evaluate(
+            "(content) => navigator.clipboard.writeText(content)", content
+        )
+        await page.keyboard.press("ControlOrMeta+V")
+        await asyncio.sleep(0.5)
+
+        expected_tail = _squash(content)[-40:]
+        if expected_tail and expected_tail not in _squash(await target.inner_text()):
+            logger.warning("클립보드 붙여넣기가 반영되지 않음, 키보드 입력으로 대체")
+            await _clear_editor(page)
+            return False
+        return True
+    except Exception as e:
+        logger.warning(f"클립보드 붙여넣기 실패, 키보드 입력으로 대체: {e}")
+        await _clear_editor(page)
+        return False
+
+
 async def fill_post_content(page: Page, content: str, use_html: bool = False) -> None:
     """
     블로그 글 본문을 입력합니다.
@@ -270,7 +310,8 @@ async def fill_post_content(page: Page, content: str, use_html: bool = False) ->
                                 if content_body:
                                     await content_body.click()
                                     await asyncio.sleep(0.5)
-                                    await content_body.type(content, delay=10)
+                                    if not await _paste_content(page, content, content_body):
+                                        await content_body.type(content, delay=10)
                                     content_filled = True
                                     logger.info(f"본문 입력 완료 (iframe 방식, selector: {body_selector})")
                                     break
@@ -311,7 +352,8 @@ async def fill_post_content(page: Page, content: str, use_html: bool = False) ->
                         await asyncio.sleep(0.2)
 
                         # 본문 입력
-                        await page.keyboard.type(content, delay=10)
+                        if not await _paste_content(page, content, element):
+                            await page.keyboard.type(content, delay=10)
                         content_filled = True
                         logger.info(f"본문 입력 완료 (직접 방식, selector: {selector})")
                         break

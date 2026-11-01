@@ -7,6 +7,7 @@ from typing import Optional
 
 from playwright.async_api import Browser, BrowserContext
 
+from ..automation.browser import new_browser_context
 from ..automation.login import login_to_naver, verify_login_session, NaverLoginError
 
 
@@ -97,7 +98,9 @@ class SessionManager:
         # 1. 기존 세션 파일이 있고 유효하면 재사용
         if self.is_session_file_valid():
             try:
-                context = await browser.new_context(storage_state=self.storage_path)
+                context = await new_browser_context(
+                    browser, storage_state=self.storage_path
+                )
 
                 # 실제 로그인 상태 확인
                 if await self.is_session_valid(context):
@@ -110,7 +113,7 @@ class SessionManager:
                 print(f"세션 복원 실패: {e}. 재로그인합니다.")
 
         # 2. 새로 로그인
-        context = await browser.new_context()
+        context = await new_browser_context(browser)
         page = await context.new_page()
 
         try:

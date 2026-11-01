@@ -31,11 +31,13 @@ class Config:
     )
     SESSION_VALIDITY_HOURS: int = int(os.getenv("SESSION_VALIDITY_HOURS", "24"))
 
-    # Playwright 브라우저 설정
+    # Playwright 브라우저 설정.
+    # --enable-automation 이 남아 있으면 네이버가 영수증 캡차를 더 자주 띄운다.
     BROWSER_ARGS: list[str] = [
         "--disable-blink-features=AutomationControlled",
         "--disable-dev-shm-usage",
     ]
+    BROWSER_IGNORE_DEFAULT_ARGS: list[str] = ["--enable-automation"]
 
     USER_AGENT: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -60,6 +62,7 @@ class Config:
             "headless": cls.HEADLESS,
             "args": cls.BROWSER_ARGS,
             "slow_mo": cls.SLOW_MO,
+            "ignore_default_args": list(cls.BROWSER_IGNORE_DEFAULT_ARGS),
         }
 
     @classmethod

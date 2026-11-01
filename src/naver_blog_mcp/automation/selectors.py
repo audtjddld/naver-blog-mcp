@@ -16,8 +16,26 @@ class NaverSelectors:
     LOGIN = {
         "id_input": "#id",
         "pw_input": "#pw",
-        "login_btn": [".btn_login", "button[type='submit']"],
+        "login_btn": [
+            "#loginBtn_row:visible",
+            "#loginBtn_column:visible",
+            "button[data-nlog-area='login.loginbtn']:visible",
+            "#log\\.login",
+            ".btn_login",
+            "button[type='submit']",
+            "button:has-text('로그인')",
+            "button:has-text('Sign in')",
+        ],
         "error_message": ".error_message",
+        # 영수증 캡차("보안을 위해 추가 확인을 해주세요")는 로그인 폼으로
+        # 돌아온 뒤 비밀번호만 지운다. 답 입력칸이 보이면 자동 클릭하지 않는다.
+        "captcha": [
+            "#captcha:visible",
+            "input[name='captcha']:visible",
+            "#chptcha:visible",
+            "input[placeholder*='정답']:visible",
+            "text=보안을 위해 추가 확인을 해주세요",
+        ],
     }
 
     # 블로그 메인

@@ -14,7 +14,8 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
-from .config import get_browser_config, config
+from .config import config
+from .automation.browser import launch_browser, new_browser_context
 from .services.session_manager import SessionManager
 from .automation.login import verify_login_session
 from .mcp.tools import (
@@ -49,8 +50,7 @@ class NaverBlogMCPServer:
 
         # 세션 관리자 초기화
         self.session_manager = SessionManager(
-            user_id=config.NAVER_BLOG_ID,
-            password=config.NAVER_BLOG_PASSWORD
+            user_id=config.NAVER_BLOG_ID, password=config.NAVER_BLOG_PASSWORD
         )
 
         # Tool 등록
@@ -72,7 +72,10 @@ class NaverBlogMCPServer:
                 if isinstance(payload, str):
                     return [{"type": "text", "text": payload}]
                 return [
-                    {"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)}
+                    {
+                        "type": "text",
+                        "text": json.dumps(payload, ensure_ascii=False, indent=2),
+                    }
                 ]
 
             try:
@@ -167,7 +170,7 @@ class NaverBlogMCPServer:
                 Tool(
                     name=tool_data["name"],
                     description=tool_data["description"],
-                    inputSchema=tool_data["inputSchema"]
+                    inputSchema=tool_data["inputSchema"],
                 )
                 for tool_data in TOOLS_METADATA.values()
             ]
@@ -187,18 +190,16 @@ class NaverBlogMCPServer:
             self.playwright = await async_playwright().start()
 
         if self.browser is None:
-            browser_config = get_browser_config()
-            self.browser = await self.playwright.chromium.launch(**browser_config)
-            logger.info(
-                f"Browser launched (headless={browser_config.get('headless', True)})"
-            )
+            self.browser = await launch_browser(self.playwright)
+            logger.info("Browser launched (headless=%s)", config.HEADLESS)
 
         # 저장된 세션이 유효하면 재사용
         if self.session_manager.is_session_file_valid():
             ctx = None
             try:
-                ctx = await self.browser.new_context(
-                    storage_state=self.session_manager.storage_path
+                ctx = await new_browser_context(
+                    self.browser,
+                    storage_state=self.session_manager.storage_path,
                 )
                 if await self.session_manager.is_session_valid(ctx):
                     self.context = ctx
@@ -215,7 +216,7 @@ class NaverBlogMCPServer:
                 logger.warning(f"세션 복원 실패: {e}. 미로그인 컨텍스트로 시작.")
 
         # 빈 컨텍스트 (미로그인)
-        self.context = await self.browser.new_context()
+        self.context = await new_browser_context(self.browser)
         logger.info("빈 컨텍스트 생성 (미로그인)")
 
     async def reset_browser_for_login(self):
@@ -242,10 +243,8 @@ class NaverBlogMCPServer:
             self.playwright = await async_playwright().start()
 
         # 2차 인증/CAPTCHA 수동 처리를 위해 headed 강제
-        browser_config = get_browser_config()
-        browser_config["headless"] = False
-        self.browser = await self.playwright.chromium.launch(**browser_config)
-        self.context = await self.browser.new_context()
+        self.browser = await launch_browser(self.playwright, headless=False)
+        self.context = await new_browser_context(self.browser)
         logger.info("로그인용 새 headed 브라우저/컨텍스트 생성")
 
     async def cleanup(self):
@@ -293,7 +292,7 @@ class NaverBlogMCPServer:
                 await self.server.run(
                     read_stream,
                     write_stream,
-                    self.server.create_initialization_options()
+                    self.server.create_initialization_options(),
                 )
         except Exception as e:
             logger.error(f"Server error: {e}", exc_info=True)

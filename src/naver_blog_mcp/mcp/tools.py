@@ -26,7 +26,8 @@ TOOLS_METADATA = {
         "name": "naver_blog_login",
         "description": (
             "네이버 로그인을 시작합니다. 기존 창을 닫고 새 브라우저 창을 열어 ID/PW를 제출합니다. "
-            "2차 인증/CAPTCHA가 있으면 사용자가 브라우저에서 직접 완료해야 합니다. "
+            "영수증 캡차나 2차 인증이 있으면 사용자가 브라우저에서 답을 입력합니다. "
+            "캡차 후 비밀번호가 지워지면 자동으로 다시 채웁니다. "
             "완료 여부를 사용자에게 물어본 뒤 naver_blog_confirm_login으로 확인하세요."
         ),
         "inputSchema": {
@@ -181,7 +182,8 @@ async def handle_login(page: Page, user_id: str, password: str) -> Dict[str, Any
             "status": "login_started",
             "message": (
                 "새 로그인 창에서 아이디/비밀번호를 제출했습니다. "
-                "브라우저 창에서 2차 인증 또는 CAPTCHA가 있으면 완료해 주세요. "
+                "영수증 캡차나 2차 인증이 뜨면 브라우저에서 답을 입력해 주세요. "
+                "캡차 후 비밀번호가 지워지면 자동으로 다시 채웁니다. "
                 "완료되면 '네/완료'라고 알려주시면 naver_blog_confirm_login으로 확인합니다."
             ),
         }
@@ -194,7 +196,9 @@ async def handle_login(page: Page, user_id: str, password: str) -> Dict[str, Any
         }
 
 
-async def handle_confirm_login(page: Page, context, storage_path: str) -> Dict[str, Any]:
+async def handle_confirm_login(
+    page: Page, context, storage_path: str
+) -> Dict[str, Any]:
     """로그인(2차 인증 포함) 완료 여부를 확인하고, 성공 시 세션을 저장합니다.
 
     Args:
@@ -283,7 +287,9 @@ async def handle_create_post(
                 images_uploaded = len(upload_result.get("uploaded", []))
 
                 if upload_result.get("failed"):
-                    logger.warning(f"일부 이미지 업로드 실패: {upload_result['failed']}")
+                    logger.warning(
+                        f"일부 이미지 업로드 실패: {upload_result['failed']}"
+                    )
 
                 logger.info(f"이미지 업로드 완료: {images_uploaded}/{len(images)}개")
 
@@ -313,7 +319,9 @@ async def handle_create_post(
         # 결과에 이미지 정보 추가
         result["images_uploaded"] = images_uploaded
 
-        logger.info(f"글 작성 완료: {result.get('post_url', 'N/A')} (이미지 {images_uploaded}개)")
+        logger.info(
+            f"글 작성 완료: {result.get('post_url', 'N/A')} (이미지 {images_uploaded}개)"
+        )
         return result
 
     except NaverBlogPostError as e:
@@ -479,5 +487,5 @@ async def handle_list_categories(page: Page) -> Dict[str, Any]:
         return {
             "success": False,
             "message": f"카테고리 조회 실패: {str(e)}",
-            "categories": []
+            "categories": [],
         }

@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import re
 import weakref
 from typing import Optional, Dict, Any
 
@@ -18,8 +17,6 @@ from .selectors import (
 
 logger = logging.getLogger(__name__)
 
-# 줄이 URL로 끝나면 스마트에디터 ONE이 OG 링크 카드로 바꾸고 다음 줄과 붙인다.
-_URL_AT_LINE_END = re.compile(r"https?://\S+$", re.IGNORECASE)
 # '작성 중인 글이 있습니다'는 제목 노드보다 늦게 붙는다. 그 전에 한 번만 보면 놓친다.
 CONTINUE_POPUP_WAIT_S = 6.0
 CONTINUE_POPUP_POLL_S = 0.5
@@ -183,14 +180,6 @@ async def click_editor_target(page: Page, selectors: object, *, what: str) -> st
     raise NaverBlogPostError(f"{what} 클릭이 이어쓰기 팝업에 막혔습니다: {last_error}")
 
 
-def prepare_editor_line(line: str) -> str:
-    """URL로 끝나는 줄 뒤에 폭 없는 문자를 붙여 OG 링크 카드를 피한다."""
-    stripped = line.rstrip()
-    if stripped and _URL_AT_LINE_END.search(stripped):
-        return stripped + "\u200b"
-    return line
-
-
 async def navigate_to_post_write_page(
     page: Page, blog_id: Optional[str] = None, timeout: int = 30000
 ) -> None:
@@ -289,11 +278,12 @@ async def fill_post_content(page: Page, content: str, use_html: bool = False) ->
         await ensure_continue_popup_cleared(page)
         selector = await click_editor_target(page, POST_WRITE_CONTENT_BODY, what="본문")
         await _sleep(0.3)
+        # 줄은 있는 그대로 넣는다. URL 끝에 U+200B를 붙이면 스마트에디터가
+        # 접두어(출처 예시:)를 지우고 주소를 다음 줄 끝에 붙인다.
         lines = content.split("\n")
         for index, line in enumerate(lines):
-            text = prepare_editor_line(line)
-            if text:
-                await page.keyboard.insert_text(text)
+            if line:
+                await page.keyboard.insert_text(line)
             if index < len(lines) - 1:
                 await page.keyboard.press("Enter")
         logger.info("본문 입력 완료 (%s)", selector)

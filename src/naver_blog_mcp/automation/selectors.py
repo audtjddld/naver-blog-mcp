@@ -61,10 +61,11 @@ class NaverSelectors:
             ".se-placeholder:has-text('글감과 함께')",
         ],
         # 이어쓰기 모달은 '확인'이 아니라 '취소'다. 확인을 누르면 기존 초안을 연다.
+        # :has-text('취소') 는 툴바 '취소선'까지 맞아 본문 전체에 취소선이 켜진다.
         "popup_dismiss": [
             ".se-popup-button-cancel",
             "button.se-popup-button-cancel",
-            "button:has-text('취소')",
+            ".se-popup button:text-is('취소')",
             "button.se-help-panel-close-button",
             ".se-popup-close-button",
         ],

@@ -279,16 +279,40 @@ async def test_blank_lines_become_enter_without_insert() -> None:
 
 
 @pytest.mark.asyncio
-async def test_url_ending_line_does_not_stay_a_bare_url() -> None:
+async def test_url_line_is_inserted_unchanged_before_the_next_line() -> None:
+    """URL 줄 끝에 문자를 붙이면 접두어가 지워지고 주소가 다음 줄 끝으로 붙는다."""
     page = EditorPage()
     page.visible[".se-component.se-text .se-text-paragraph"] = True
+    body = (
+        "MCP 수정 후 동작 확인용 임시저장 글입니다.\n"
+        "둘째 줄입니다.\n"
+        "출처 예시: https://www.cdc.gov/ncbddd/actearly/milestones/milestones-15mo.html\n"
+        "링크 다음 줄이 따로 떨어져 있어야 합니다."
+    )
 
-    await fill_post_content(page, "설명 https://example.com/a\n다음 줄")
+    await fill_post_content(page, body)
 
-    assert page.inserted[0].startswith("설명 https://example.com/a")
-    assert not page.inserted[0].endswith("https://example.com/a")
-    assert page.inserted[1] == "다음 줄"
-    assert page.pressed == ["Enter"]
+    assert page.inserted == [
+        "MCP 수정 후 동작 확인용 임시저장 글입니다.",
+        "둘째 줄입니다.",
+        "출처 예시: https://www.cdc.gov/ncbddd/actearly/milestones/milestones-15mo.html",
+        "링크 다음 줄이 따로 떨어져 있어야 합니다.",
+    ]
+    assert "\u200b" not in "".join(page.inserted)
+    assert page.pressed == ["Enter", "Enter", "Enter"]
+
+
+@pytest.mark.asyncio
+async def test_dismiss_does_not_click_strikethrough_labeled_cancel() -> None:
+    """button:has-text('취소') 는 툴바 '취소선' 버튼까지 눌러 본문 전체에 취소선을 켠다."""
+    page = EditorPage()
+    page.visible[".se-component.se-text .se-text-paragraph"] = True
+    page.visible["button:has-text('취소')"] = True
+
+    await fill_post_content(page, "둘째 줄입니다.")
+
+    assert "button:has-text('취소')" not in page.clicked
+    assert page.inserted == ["둘째 줄입니다."]
 
 
 @pytest.mark.asyncio

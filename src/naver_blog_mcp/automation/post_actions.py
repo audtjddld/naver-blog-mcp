@@ -2,28 +2,104 @@
 
 import asyncio
 import logging
+import re
 from typing import Optional, Dict, Any
-from pathlib import Path
 
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeout
 
 from .selectors import (
     POST_WRITE_TITLE,
-    POST_WRITE_CONTENT_FRAME,
     POST_WRITE_CONTENT_BODY,
     POST_WRITE_PUBLISH_BTN,
-    POST_WRITE_CATEGORY_BTN,
-    POST_WRITE_TAG_INPUT,
+    NaverSelectors,
 )
 
 
 logger = logging.getLogger(__name__)
+
+# 줄이 URL로 끝나면 스마트에디터 ONE이 OG 링크 카드로 바꾸고 다음 줄과 붙인다.
+_URL_AT_LINE_END = re.compile(r"https?://\S+$", re.IGNORECASE)
 
 
 class NaverBlogPostError(Exception):
     """네이버 블로그 글쓰기 관련 에러."""
 
     pass
+
+
+async def _sleep(seconds: float) -> None:
+    await asyncio.sleep(seconds)
+
+
+def _configured_blog_id() -> Optional[str]:
+    """로그인 아이디와 같은 블로그 아이디. 없으면 None."""
+    try:
+        from ..config import config
+
+        blog_id = (config.NAVER_BLOG_ID or "").strip()
+    except Exception:
+        return None
+    return blog_id or None
+
+
+def _frames_of(page: Page) -> list:
+    frames = getattr(page, "frames", None)
+    if frames:
+        return list(frames)
+    return [page]
+
+
+def _as_selectors(selectors: object) -> list[str]:
+    if isinstance(selectors, str):
+        return [selectors]
+    return list(selectors)  # type: ignore[arg-type]
+
+
+async def find_visible(page: Page, selectors: object):
+    """모든 프레임에서 보이는 첫 요소를 찾는다.
+
+    Returns:
+        (frame, locator, selector) 또는 없으면 (None, None, None).
+    """
+    for frame in _frames_of(page):
+        for selector in _as_selectors(selectors):
+            try:
+                locator = frame.locator(selector)
+                count = await locator.count()
+                for index in range(min(count, 5)):
+                    candidate = locator.nth(index)
+                    if await candidate.is_visible():
+                        return frame, candidate, selector
+            except Exception:
+                continue
+    return None, None, None
+
+
+async def dismiss_write_popups(page: Page, rounds: int = 2) -> None:
+    """'작성 중인 글 이어쓰기'는 취소해야 새 글에 입력된다.
+
+    확인 버튼은 이어쓰기를 수락하므로 누르지 않는다.
+    """
+    selectors = NaverSelectors.POST_WRITE["popup_dismiss"]
+    for _ in range(rounds):
+        _frame, element, selector = await find_visible(page, selectors)
+        if element is None:
+            return
+        try:
+            await element.click()
+            logger.info("글쓰기 팝업 닫기: %s", selector)
+        except Exception as exc:
+            logger.info("글쓰기 팝업 닫기 실패(무시): %s", exc)
+            return
+        await _sleep(0.2)
+
+
+def prepare_editor_line(line: str) -> str:
+    """URL로 끝나는 줄 뒤에 폭 없는 문자를 붙여 OG 링크 카드를 피한다."""
+    stripped = line.rstrip()
+    if stripped and _URL_AT_LINE_END.search(stripped):
+        return stripped + "\u200b"
+    return line
 
 
 async def navigate_to_post_write_page(
@@ -41,84 +117,47 @@ async def navigate_to_post_write_page(
         NaverBlogPostError: 페이지 이동 실패 시
     """
     try:
-        # 방법 1: blog_id가 주어진 경우
+        # blog.naver.com 루트는 500이 잦다. 글쓰기 URL로 바로 간다.
+        if isinstance(blog_id, str):
+            blog_id = blog_id.strip() or None
+        if not blog_id:
+            blog_id = _configured_blog_id()
         if blog_id:
             url = f"https://blog.naver.com/{blog_id}/postwrite"
         else:
-            # 방법 2: 블로그 메인에서 글쓰기 버튼 찾아서 클릭
-            # 먼저 블로그 메인으로 이동
-            await page.goto("https://blog.naver.com", wait_until="load", timeout=timeout)
-            await asyncio.sleep(2)
+            url = "https://blog.naver.com/postwrite"
 
-            # 글쓰기 버튼 찾기 (여러 셀렉터 시도)
-            write_btn_selectors = [
-                "a[href*='postwrite']",
-                "a:has-text('글쓰기')",
-                "button:has-text('글쓰기')",
-            ]
+        await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
 
-            write_btn_found = False
-            for selector in write_btn_selectors:
-                count = await page.locator(selector).count()
-                if count > 0:
-                    # href 가져오기
-                    element = page.locator(selector).first
-                    href = await element.get_attribute("href")
-                    if href:
-                        # 절대 URL로 변환
-                        if href.startswith("/"):
-                            url = f"https://blog.naver.com{href}"
-                        elif href.startswith("http"):
-                            url = href
-                        else:
-                            url = f"https://blog.naver.com/{href}"
-                        write_btn_found = True
-                        print(f"   글쓰기 버튼 발견: {url}")
-                        break
+        for _ in range(8):
+            _frame, element, _selector = await find_visible(page, POST_WRITE_TITLE)
+            if element is not None:
+                break
+            await _sleep(1)
 
-            if not write_btn_found:
-                # 기본 URL 사용
-                url = "https://blog.naver.com/postwrite"
-                print(f"   글쓰기 버튼을 찾지 못했습니다. 기본 URL 사용: {url}")
-
-        await page.goto(url, wait_until="load", timeout=timeout)
-        await asyncio.sleep(3)  # 에디터 로딩 충분히 대기
-
-        # 글쓰기 페이지인지 확인
         current_url = page.url
-        print(f"   현재 URL: {current_url}")
-
-        # URL에 postwrite, PostWriteForm, Redirect=Write가 포함되어 있으면 성공으로 간주
-        if ("postwrite" in current_url.lower() or
-            "PostWriteForm" in current_url or
-            "Redirect=Write" in current_url):
-            logger.info(f"글쓰기 페이지로 이동: {current_url}")
+        logger.info("글쓰기 페이지 URL: %s", current_url)
+        if (
+            "postwrite" in current_url.lower()
+            or "PostWriteForm" in current_url
+            or "Redirect=Write" in current_url
+        ):
             return
 
-        # 제목 입력란 확인 (추가 검증)
-        title_input_exists = False
-        if isinstance(POST_WRITE_TITLE, list):
-            for selector in POST_WRITE_TITLE:
-                count = await page.locator(selector).count()
-                if count > 0:
-                    title_input_exists = True
-                    print(f"   제목 입력란 발견: {selector}")
-                    break
-        else:
-            count = await page.locator(POST_WRITE_TITLE).count()
-            title_input_exists = count > 0
-
-        if title_input_exists:
-            logger.info(f"글쓰기 페이지로 이동: {url}")
+        _frame, element, selector = await find_visible(page, POST_WRITE_TITLE)
+        if element is not None:
+            logger.info("제목 입력란 발견: %s", selector)
             return
 
-        raise NaverBlogPostError(f"글쓰기 페이지 로딩에 실패했습니다. 현재 URL: {current_url}")
+        raise NaverBlogPostError(
+            f"글쓰기 페이지 로딩에 실패했습니다. 현재 URL: {current_url}"
+        )
 
+    except NaverBlogPostError:
+        raise
     except PlaywrightTimeout as e:
         raise NaverBlogPostError(f"글쓰기 페이지 이동 시간 초과: {str(e)}")
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         raise NaverBlogPostError(f"글쓰기 페이지 이동 중 오류: {str(e)}")
 
 
@@ -134,260 +173,50 @@ async def fill_post_title(page: Page, title: str) -> None:
         NaverBlogPostError: 제목 입력 실패 시
     """
     try:
-        # 제목 입력란 찾기 (대체 셀렉터 시도)
-        title_filled = False
-
-        # 방법 1: 일반적인 셀렉터 시도
-        if isinstance(POST_WRITE_TITLE, list):
-            for selector in POST_WRITE_TITLE:
-                try:
-                    element_count = await page.locator(selector).count()
-                    if element_count > 0:
-                        # contenteditable div는 fill 대신 type 사용
-                        element = page.locator(selector).first
-
-                        # contenteditable인지 확인
-                        is_contenteditable = await element.get_attribute("contenteditable")
-
-                        if is_contenteditable:
-                            # contenteditable div: 클릭 후 타이핑
-                            await element.click()
-                            await asyncio.sleep(0.3)
-                            await element.type(title, delay=50)
-                        else:
-                            # 일반 input: fill 사용
-                            await element.fill(title)
-
-                        title_filled = True
-                        logger.info(f"제목 입력 완료: {title} (selector: {selector})")
-                        break
-                except Exception as e:
-                    print(f"   셀렉터 {selector} 실패: {e}")
-                    continue
-
-        # 방법 2: 제목 영역을 직접 클릭 (좌표 기반)
-        if not title_filled:
-            try:
-                # 제목 영역 대략적인 위치 클릭 (상단 중앙)
-                await page.mouse.click(450, 250)
-                await asyncio.sleep(0.5)
-                await page.keyboard.type(title, delay=50)
-                title_filled = True
-                logger.info(f"제목 입력 완료 (클릭 방식): {title}")
-            except Exception as e:
-                print(f"   클릭 방식 실패: {e}")
-
-        # 방법 3: Tab 키로 이동
-        if not title_filled:
-            try:
-                # 페이지 최상단으로 포커스 이동 후 Tab으로 제목까지 이동
-                await page.keyboard.press("Tab")
-                await asyncio.sleep(0.3)
-                await page.keyboard.type(title, delay=50)
-                title_filled = True
-                logger.info(f"제목 입력 완료 (Tab 방식): {title}")
-            except Exception as e:
-                print(f"   Tab 방식 실패: {e}")
-
-        if not title_filled:
+        await dismiss_write_popups(page)
+        _frame, element, selector = await find_visible(page, POST_WRITE_TITLE)
+        if element is None:
             raise NaverBlogPostError("제목 입력란을 찾을 수 없습니다.")
-
-        await asyncio.sleep(0.5)
-
+        await element.click()
+        await _sleep(0.3)
+        await page.keyboard.type(title, delay=20)
+        logger.info("제목 입력 완료: %s (%s)", title, selector)
+        await _sleep(0.3)
+    except NaverBlogPostError:
+        raise
     except Exception as e:
         raise NaverBlogPostError(f"제목 입력 중 오류: {str(e)}")
 
 
-def _squash(text: str) -> str:
-    """공백을 모두 제거합니다. 편집기가 단락을 나눠도 비교가 되도록."""
-    return "".join(text.split())
-
-
-async def _clear_editor(page: Page, target: Any) -> bool:
-    """편집기를 비우고 실제로 비었는지 확인합니다.
-
-    잔여 텍스트가 남으면 이후 입력이 그 위에 덧붙어 본문이 중복되므로,
-    비웠다고 확인되지 않으면 False를 반환합니다.
-    """
-    try:
-        await page.keyboard.press("ControlOrMeta+A")
-        await page.keyboard.press("Delete")
-        await asyncio.sleep(0.2)
-        return _squash(await target.inner_text()) == ""
-    except Exception as e:
-        logger.warning(f"편집기 초기화 실패: {e}")
-        return False
-
-
-async def _paste_content(page: Page, content: str, target: Any) -> bool:
-    """포커스된 편집기에 본문 전체를 한 번에 붙여넣습니다.
-
-    키 입력이 성공해도 편집기가 붙여넣기를 반영했다는 보장이 없으므로,
-    빈 편집기에서 시작해 반영 여부를 읽어서 확인한 뒤에만 True를 반환합니다.
-
-    Returns:
-        True면 붙여넣기가 반영됨. False면 편집기가 비어 있음이 확인된 상태이므로
-        호출자가 안전하게 키보드 입력으로 폴백할 수 있습니다.
-
-    Raises:
-        NaverBlogPostError: 편집기를 비웠는지 확인할 수 없어 폴백도 안전하지 않을 때.
-            조용히 본문이 중복되거나 누락되는 것보다 실패를 드러냅니다.
-    """
-    # 잔여 텍스트가 있으면 꼬리 비교가 이전 내용에 매칭돼 오판한다.
-    # 같은 본문을 재시도하는 경우가 특히 위험하다.
-    if not await _clear_editor(page, target):
-        raise NaverBlogPostError("본문 입력 전 편집기를 비우지 못했습니다.")
-
-    try:
-        await page.context.grant_permissions(["clipboard-read", "clipboard-write"])
-        await page.evaluate(
-            "(content) => navigator.clipboard.writeText(content)", content
-        )
-        await page.keyboard.press("ControlOrMeta+V")
-        await asyncio.sleep(0.5)
-        pasted = _squash(await target.inner_text())
-    except Exception as e:
-        logger.warning(f"클립보드 붙여넣기 실패, 키보드 입력으로 대체: {e}")
-        pasted = None
-
-    expected = _squash(content)
-    if pasted is not None and (pasted == expected or (expected and expected[-40:] in pasted)):
-        return True
-
-    logger.warning("클립보드 붙여넣기가 반영되지 않음, 키보드 입력으로 대체")
-    if not await _clear_editor(page, target):
-        raise NaverBlogPostError("붙여넣기 실패 후 편집기를 비우지 못했습니다.")
-    return False
-
-
 async def fill_post_content(page: Page, content: str, use_html: bool = False) -> None:
-    """
-    블로그 글 본문을 입력합니다.
-    스마트에디터 ONE은 iframe 없이 직접 contenteditable을 사용합니다.
+    """블로그 글 본문을 한 줄씩 넣는다.
 
-    Args:
-        page: Playwright Page 객체
-        content: 글 본문 내용
-        use_html: HTML 모드로 입력할지 여부 (기본: False, 텍스트 모드)
-
-    Raises:
-        NaverBlogPostError: 본문 입력 실패 시
+    스마트에디터 ONE의 본문은 iframe이 아니라 보이는
+    `.se-component.se-text .se-text-paragraph` 이다. contenteditable 전체를
+    잡으면 화면 밖 클립보드 헬퍼라서 클릭이 타임아웃되고, 그 경로로 편집기를
+    비우려다 '본문 입력 전 편집기를 비우지 못했습니다'가 난다.
     """
+    if use_html:
+        logger.info("스마트에디터 ONE은 HTML 모드가 없어 텍스트로 입력합니다.")
     try:
-        # 팝업이 있으면 먼저 닫기
-        try:
-            popup_selectors = [
-                "button:has-text('확인')",
-                "button:has-text('닫기')",
-                "button.se-popup-button-confirm",
-                ".se-popup-button-confirm",
-            ]
-            for popup_selector in popup_selectors:
-                popup_count = await page.locator(popup_selector).count()
-                if popup_count > 0:
-                    await page.click(popup_selector, timeout=2000)
-                    print(f"   팝업 닫기: {popup_selector}")
-                    await asyncio.sleep(0.5)
-                    break
-        except Exception as e:
-            print(f"   팝업 확인 실패 (무시): {e}")
-
-        content_filled = False
-
-        # 방법 1: iframe이 있는 경우 (구형 스마트에디터)
-        iframe_selectors = POST_WRITE_CONTENT_FRAME if isinstance(POST_WRITE_CONTENT_FRAME, list) else [POST_WRITE_CONTENT_FRAME]
-
-        for iframe_selector in iframe_selectors:
-            try:
-                iframe_count = await page.locator(iframe_selector).count()
-                if iframe_count > 0:
-                    print(f"   iframe 발견: {iframe_selector}")
-                    frame_element = await page.wait_for_selector(iframe_selector, timeout=5000)
-                    iframe_found = await frame_element.content_frame()
-
-                    if iframe_found:
-                        # iframe 내부 팝업 닫기
-                        try:
-                            iframe_popup_selectors = [
-                                "button:has-text('확인')",
-                                "button:has-text('닫기')",
-                                ".se-popup-button-confirm",
-                            ]
-                            for popup_sel in iframe_popup_selectors:
-                                popup_count = await iframe_found.locator(popup_sel).count()
-                                if popup_count > 0:
-                                    await iframe_found.locator(popup_sel).click(timeout=2000)
-                                    print(f"   iframe 내부 팝업 닫기: {popup_sel}")
-                                    await asyncio.sleep(0.5)
-                                    break
-                        except Exception as e:
-                            print(f"   iframe 팝업 닫기 실패 (무시): {e}")
-
-                        # iframe 내부에서 contenteditable 찾기
-                        body_selectors = POST_WRITE_CONTENT_BODY if isinstance(POST_WRITE_CONTENT_BODY, list) else [POST_WRITE_CONTENT_BODY]
-
-                        for body_selector in body_selectors:
-                            try:
-                                content_body = await iframe_found.wait_for_selector(body_selector, timeout=3000)
-                                if content_body:
-                                    await content_body.click()
-                                    await asyncio.sleep(0.5)
-                                    if not await _paste_content(page, content, content_body):
-                                        await content_body.type(content, delay=10)
-                                    content_filled = True
-                                    logger.info(f"본문 입력 완료 (iframe 방식, selector: {body_selector})")
-                                    break
-                            except Exception as e:
-                                print(f"   iframe 내부 셀렉터 {body_selector} 실패: {e}")
-                                continue
-
-                        if content_filled:
-                            # iframe에서 메인 페이지로 포커스 전환
-                            await page.evaluate("() => { window.focus(); }")
-                            await asyncio.sleep(0.5)
-                            break
-            except:
-                continue
-
-        # 방법 2: iframe 없이 직접 contenteditable (스마트에디터 ONE)
-        if not content_filled:
-            print("   iframe 없음, 직접 contenteditable 찾기 시도")
-
-            # 본문 영역 찾기 - 여러 방법 시도
-            content_selectors = [
-                "div[contenteditable='true']:not([data-placeholder='제목'])",  # 제목이 아닌 contenteditable
-                "div[contenteditable='true'][role='textbox']",
-                "div.se-component",  # 스마트에디터 컴포넌트
-                "div:has-text('글감과 함께')",  # 플레이스홀더 텍스트로 찾기
-            ]
-
-            for selector in content_selectors:
-                try:
-                    element_count = await page.locator(selector).count()
-                    if element_count > 0:
-                        element = page.locator(selector).first
-                        await element.click()
-                        await asyncio.sleep(0.5)
-
-                        # 기존 플레이스홀더 텍스트 제거
-                        await page.keyboard.press("Control+A")
-                        await asyncio.sleep(0.2)
-
-                        # 본문 입력
-                        if not await _paste_content(page, content, element):
-                            await page.keyboard.type(content, delay=10)
-                        content_filled = True
-                        logger.info(f"본문 입력 완료 (직접 방식, selector: {selector})")
-                        break
-                except Exception as e:
-                    print(f"   셀렉터 {selector} 실패: {e}")
-                    continue
-
-        if not content_filled:
+        await dismiss_write_popups(page)
+        _frame, element, selector = await find_visible(page, POST_WRITE_CONTENT_BODY)
+        if element is None:
             raise NaverBlogPostError("본문 입력 영역을 찾을 수 없습니다.")
 
-        await asyncio.sleep(1)
-
+        await element.click()
+        await _sleep(0.3)
+        lines = content.split("\n")
+        for index, line in enumerate(lines):
+            text = prepare_editor_line(line)
+            if text:
+                await page.keyboard.insert_text(text)
+            if index < len(lines) - 1:
+                await page.keyboard.press("Enter")
+        logger.info("본문 입력 완료 (%s)", selector)
+        await _sleep(0.5)
+    except NaverBlogPostError:
+        raise
     except PlaywrightTimeout as e:
         raise NaverBlogPostError(f"본문 입력 시간 초과: {str(e)}")
     except Exception as e:
@@ -397,39 +226,28 @@ async def fill_post_content(page: Page, content: str, use_html: bool = False) ->
 async def save_draft(page: Page) -> Dict[str, Any]:
     """현재 작성 중인 글을 임시저장(저장)한다.
 
-    발행하지 않고 에디터의 '저장' 버튼을 눌러 임시저장 보관함에 저장한다.
+    발행하지 않고 에디터의 저장 버튼을 누른다. 클래스 해시
+    `save_btn__...` 은 배포마다 바뀌므로 부분 일치로 찾는다.
 
     Returns:
         {"success": bool, "message": str, "post_url": None}
     """
     try:
         await page.bring_to_front()
-        await asyncio.sleep(1)
-
-        saved = False
-        for frame in page.frames:
+        await _sleep(0.5)
+        _frame, element, selector = await find_visible(
+            page, NaverSelectors.POST_WRITE["temp_save_btn"]
+        )
+        if element is None:
             try:
-                candidates = [
-                    "button.save_btn__bzc5B",
-                    "button:has-text('저장'):visible",
-                    "a:has-text('저장'):visible",
-                ]
-                for sel in candidates:
-                    if await frame.locator(sel).count() > 0:
-                        await frame.locator(sel).first.click(timeout=5000)
-                        saved = True
-                        logger.info(f"임시저장 버튼 클릭: {sel}")
-                        break
-                if saved:
-                    break
+                await page.screenshot(path="playwright-state/error_save_draft.png")
             except Exception:
-                continue
-
-        if not saved:
-            await page.screenshot(path="playwright-state/error_save_draft.png")
+                pass
             raise NaverBlogPostError("임시저장(저장) 버튼을 찾을 수 없습니다.")
 
-        await asyncio.sleep(2)
+        await element.click(timeout=5000)
+        logger.info("임시저장 버튼 클릭: %s", selector)
+        await _sleep(1)
         return {
             "success": True,
             "message": "임시저장되었습니다. (발행되지 않음)",
@@ -473,7 +291,9 @@ async def _select_category(page: Page, category: str) -> bool:
                 return True
         except Exception:
             continue
-    logger.warning(f"카테고리 '{category}' 설정 실패(요소 미발견). 기본 카테고리로 진행.")
+    logger.warning(
+        f"카테고리 '{category}' 설정 실패(요소 미발견). 기본 카테고리로 진행."
+    )
     return False
 
 
@@ -532,7 +352,9 @@ async def publish_post(
         # 0. 메인 페이지로 포커스 전환 (iframe에서 나오기)
         # 명시적으로 메인 페이지로 전환
         await page.bring_to_front()
-        await page.evaluate("() => { if (window.parent) { window.parent.focus(); } window.focus(); }")
+        await page.evaluate(
+            "() => { if (window.parent) { window.parent.focus(); } window.focus(); }"
+        )
         await asyncio.sleep(1)
 
         # 페이지가 실제로 로드되었는지 확인
@@ -608,9 +430,13 @@ async def publish_post(
                 # 발행 버튼 찾기 (우선순위: 발행 > 글쓰기)
                 search_texts = ["발행", "글쓰기"]
                 for search_text in search_texts:
-                    write_btn_count = await frame.locator(f"button:has-text('{search_text}'):visible").count()
+                    write_btn_count = await frame.locator(
+                        f"button:has-text('{search_text}'):visible"
+                    ).count()
                     if write_btn_count > 0:
-                        element = frame.locator(f"button:has-text('{search_text}'):visible").first
+                        element = frame.locator(
+                            f"button:has-text('{search_text}'):visible"
+                        ).first
                         await element.click(timeout=5000)
                         publish_clicked = True
                         logger.info(f"발행 버튼 클릭 성공 (Frame {idx})")
@@ -661,7 +487,9 @@ async def publish_post(
                             try:
                                 btn_count = await frame.locator(selector).count()
                                 if btn_count > 0:
-                                    await frame.locator(selector).first.click(force=True, timeout=5000)
+                                    await frame.locator(selector).first.click(
+                                        force=True, timeout=5000
+                                    )
                                     final_publish_clicked = True
                                     await asyncio.sleep(2)
                                     break
@@ -677,7 +505,8 @@ async def publish_post(
                 if not final_publish_clicked:
                     for frame in page.frames:
                         try:
-                            result = await frame.evaluate("""
+                            result = await frame.evaluate(
+                                """
                                 () => {
                                     const popup = document.querySelector('.layer_popup__i0QOY.is_show__TMSLq');
                                     if (!popup) return 'No popup';
@@ -691,8 +520,9 @@ async def publish_post(
                                     }
                                     return 'No button';
                                 }
-                            """)
-                            if 'Clicked' in result:
+                            """
+                            )
+                            if "Clicked" in result:
                                 await asyncio.sleep(3)
                                 break
                         except Exception:
@@ -711,7 +541,10 @@ async def publish_post(
 
                 # PostView 페이지인지 확인 (본문 영역이 있는지)
                 # 글쓰기 페이지가 아닌 글 보기 페이지인지 체크
-                if "postwrite" not in post_url.lower() and "redirect=write" not in post_url.lower():
+                if (
+                    "postwrite" not in post_url.lower()
+                    and "redirect=write" not in post_url.lower()
+                ):
                     # URL이 {blog_id}/{post_id} 형태인지 확인
                     logger.info(f"발행 완료: {post_url}")
                     return {

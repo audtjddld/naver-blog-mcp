@@ -46,18 +46,24 @@ class NaverSelectors:
 
     # 글쓰기 페이지
     POST_WRITE = {
+        # 스마트에디터 ONE 은 iframe 밖 문서의 보이는 문단이다.
+        # contenteditable 전체를 잡으면 화면 밖 클립보드 헬퍼에 걸린다.
         "title_input": [
-            "div[contenteditable='true'][data-placeholder='제목']",  # 스마트에디터 ONE
-            "div[contenteditable='true']:has-text('제목')",
-            "input[placeholder*='제목']",
-            "#title",
-            ".se-title-input",
+            ".se-documentTitle .se-text-paragraph",
+            ".se-title-text",
+            ".se-placeholder:has-text('제목')",
+            "div.se-documentTitle [contenteditable='true']",
         ],
         "content_frame": ["iframe.se-iframe", "iframe#mainFrame"],
         "content_body": [
-            "div[contenteditable='true']",  # 일반 contenteditable
-            ".se-component-content",
-            ".se-text-paragraph",
+            ".se-component.se-text .se-text-paragraph",
+            ".se-section-text .se-text-paragraph",
+            ".se-placeholder:has-text('글감과 함께')",
+        ],
+        "popup_dismiss": [
+            ".se-popup-button-cancel",
+            "button.se-help-panel-close-button",
+            ".se-popup-close-button",
         ],
         "category_select": [".blog2_series", "select[name='category']"],
         "tag_input": ["input[placeholder*='태그']", ".tag_input"],
@@ -66,7 +72,12 @@ class NaverSelectors:
             ".publish_btn",
             "button[type='submit']",
         ],
-        "temp_save_btn": ["button:has-text('임시저장')", ".temp_save_btn"],
+        "temp_save_btn": [
+            "button[class*='save_btn']",
+            "button.save_btn__bzc5B",
+            "button:has-text('저장'):visible",
+            "button:has-text('임시저장')",
+        ],
         "image_upload_btn": [
             "button[aria-label='사진']",
             ".image_upload",

@@ -279,18 +279,19 @@ async def test_blank_lines_become_enter_without_insert() -> None:
 
 
 class _AutolinkKeyboard(_Keyboard):
-    """URL로 끝나는 단락의 첫 Enter 는 자동링크가 삼킨다."""
+    """URL 직후 Enter 는 삼키고, Space 가 먼저 오면 단락이 나뉜다."""
 
     async def insert_text(self, text: str) -> None:
         await super().insert_text(text)
         self._page.paragraphs[-1] += text
-        if text.rstrip().startswith("http") or "https://" in text or "http://" in text:
-            if text.rstrip().split()[-1].startswith("http"):
-                self._page.autolink_armed = True
+        if text.rstrip().split()[-1].startswith("http"):
+            self._page.autolink_armed = True
 
     async def press(self, key: str) -> None:
         await super().press(key)
-        if key == "Escape":
+        if key == "Space" and self._page.autolink_armed:
+            self._page.paragraphs[-1] += " "
+            self._page.autolink_armed = False
             return
         if key != "Enter":
             return
@@ -308,15 +309,10 @@ class _AutolinkPage(EditorPage):
         self.keyboard = _AutolinkKeyboard(self)
         self.visible[".se-component.se-text .se-text-paragraph"] = True
 
-    async def evaluate(self, expression: str, *_args: object) -> str | None:
-        if "se-text-paragraph" not in expression:
-            return None
-        return self.paragraphs[-1]
-
 
 @pytest.mark.asyncio
-async def test_enter_after_url_is_retried_until_the_next_paragraph_starts() -> None:
-    """자동링크가 URL 직후 Enter 를 삼켜도 다음 줄은 새 단락에 있어야 한다."""
+async def test_space_before_enter_keeps_the_paragraph_after_a_url() -> None:
+    """URL 줄은 Space 다음 Enter 여야 다음 줄이 새 단락이 된다."""
     page = _AutolinkPage()
     lines = [
         "MCP 수정 후 동작 확인용 임시저장 글입니다.",
@@ -328,8 +324,9 @@ async def test_enter_after_url_is_retried_until_the_next_paragraph_starts() -> N
     await fill_post_content(page, "\n".join(lines))
 
     assert page.inserted == lines
-    assert "\u200b" not in "".join(page.inserted)
-    assert page.paragraphs == lines
+    assert page.pressed == ["Enter", "Enter", "Space", "Enter"]
+    assert "Escape" not in page.pressed
+    assert page.paragraphs == [lines[0], lines[1], lines[2] + " ", lines[3]]
 
 
 @pytest.mark.asyncio

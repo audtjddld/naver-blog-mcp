@@ -18,19 +18,8 @@ from .selectors import (
 
 logger = logging.getLogger(__name__)
 
-# URL로 끝나는 줄의 Enter 는 자동링크/OG 카드가 삼킨다.
+# URL로 끝나는 줄의 Enter 는 자동링크가 삼킨다. Space 를 먼저 누르면 단락이 나뉜다.
 _URL_AT_LINE_END = re.compile(r"https?://\S+$", re.IGNORECASE)
-_CARET_PARAGRAPH_JS = """() => {
-    const selection = window.getSelection && window.getSelection();
-    if (!selection || selection.rangeCount === 0) return null;
-    const node = selection.anchorNode;
-    if (!node) return null;
-    const element = node.nodeType === 1 ? node : node.parentElement;
-    if (!element || !element.closest) return null;
-    const paragraph = element.closest(".se-text-paragraph");
-    if (!paragraph) return null;
-    return (paragraph.innerText || "").replace(/\\u200b/g, "").trim();
-}"""
 # '작성 중인 글이 있습니다'는 제목 노드보다 늦게 붙는다. 그 전에 한 번만 보면 놓친다.
 CONTINUE_POPUP_WAIT_S = 6.0
 CONTINUE_POPUP_POLL_S = 0.5
@@ -198,56 +187,15 @@ def _line_ends_with_url(line: str) -> bool:
     return bool(_URL_AT_LINE_END.search(line.rstrip()))
 
 
-async def _caret_paragraph_text(page: Page) -> Optional[str]:
-    """캐럿이 있는 본문 단락의 글자. 읽지 못하면 None."""
-    targets = [page]
-    for frame in _frames_of(page):
-        if frame is not page:
-            targets.append(frame)
-    saw_empty = False
-    for target in targets:
-        evaluate = getattr(target, "evaluate", None)
-        if evaluate is None:
-            continue
-        try:
-            text = await evaluate(_CARET_PARAGRAPH_JS)
-        except Exception:
-            continue
-        if not isinstance(text, str):
-            continue
-        if text:
-            return text
-        saw_empty = True
-    if saw_empty:
-        return ""
-    return None
-
-
 async def _break_paragraph(page: Page, line: str) -> None:
     """한 줄을 끝낸다.
 
-    URL 직후의 Enter 는 자동링크가 확정 키로 먹어 단락이 안 나뉜다.
-    링크 제안은 Escape 로 닫고, 캐럿이 그 URL 단락에 남아 있으면 Enter 를 다시 누른다.
+    URL 직후 Enter 는 자동링크가 삼켜 다음 줄이 같은 단락에 붙는다.
+    Space 를 먼저 누르면 링크가 확정되고, 이어지는 Enter 가 새 단락을 만든다.
     """
-    if not _line_ends_with_url(line):
-        await page.keyboard.press("Enter")
-        return
-
-    url = _URL_AT_LINE_END.search(line.rstrip())
-    url_text = url.group(0) if url else ""
-    await _sleep(0.4)
-    await page.keyboard.press("Escape")
-    for attempt in range(3):
-        await page.keyboard.press("Enter")
-        await _sleep(0.25)
-        caret = await _caret_paragraph_text(page)
-        # 링크 카드로 바뀌면 본문 단락을 못 읽는다. 그때는 Enter 를 한 번만 더 누른다.
-        if caret is None:
-            if attempt == 0:
-                continue
-            return
-        if url_text not in caret:
-            return
+    if _line_ends_with_url(line):
+        await page.keyboard.press("Space")
+    await page.keyboard.press("Enter")
 
 
 async def navigate_to_post_write_page(

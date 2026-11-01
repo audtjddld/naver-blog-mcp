@@ -60,8 +60,11 @@ class NaverSelectors:
             ".se-section-text .se-text-paragraph",
             ".se-placeholder:has-text('글감과 함께')",
         ],
+        # 이어쓰기 모달은 '확인'이 아니라 '취소'다. 확인을 누르면 기존 초안을 연다.
         "popup_dismiss": [
             ".se-popup-button-cancel",
+            "button.se-popup-button-cancel",
+            "button:has-text('취소')",
             "button.se-help-panel-close-button",
             ".se-popup-close-button",
         ],

@@ -58,11 +58,17 @@ class _Locator:
         return bool(self._node.visible.get(self._selector))
 
     async def click(self, timeout: int | None = None) -> None:
+        page = self._node.page
+        page.click_timeouts.append((self._selector, timeout))
+        hook = page.before_click
+        if hook is not None:
+            await hook(self._selector, timeout)
         if not await self.is_visible():
             raise PlaywrightTimeout(self._selector)
         self._node.visible[self._selector] = False
         self._node.clicked.append(self._selector)
-        self._node.page.clicked.append(self._selector)
+        if page is not self._node:
+            page.clicked.append(self._selector)
 
 
 class Node:
@@ -87,6 +93,8 @@ class EditorPage(Node):
         self.gotos: list[dict] = []
         self.url = "about:blank"
         self.screenshots: list[str] = []
+        self.click_timeouts: list[tuple[str, int | None]] = []
+        self.before_click = None
 
     async def goto(
         self, url: str, wait_until: str | None = None, timeout: int | None = None
@@ -176,6 +184,69 @@ async def test_continue_draft_popup_is_cancelled_not_confirmed() -> None:
     await fill_post_title(page, "제목")
 
     assert page.clicked[0] == ".se-popup-button-cancel"
+    assert "button:has-text('확인')" not in page.clicked
+    assert page.typed == ["제목"]
+
+
+@pytest.mark.asyncio
+async def test_late_continue_popup_is_cancelled_before_title_click(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """이어쓰기 모달은 제목 노드보다 늦게 뜬다.
+
+    제목이 보인 직후 한 번만 닫으면 모달이 아직 없어, 이후 클릭이
+    se-container에 막혀 30초를 기다린다.
+    """
+    page = _ready_editor()
+    revealed = {"done": False}
+    sleeps = {"n": 0}
+
+    async def sleep_and_reveal(_seconds: float = 0) -> None:
+        sleeps["n"] += 1
+        if not revealed["done"] and sleeps["n"] >= 2:
+            revealed["done"] = True
+            page.visible[".se-popup-button-cancel"] = True
+            page.visible["button:has-text('확인')"] = True
+
+    monkeypatch.setattr(post_actions, "_sleep", sleep_and_reveal)
+
+    await fill_post_title(page, "제목")
+
+    assert ".se-popup-button-cancel" in page.clicked
+    assert "button:has-text('확인')" not in page.clicked
+    assert page.typed == ["제목"]
+    assert page.mouse.clicks == []
+
+
+@pytest.mark.asyncio
+async def test_intercepted_title_click_retries_after_cancel_without_30s_timeout() -> (
+    None
+):
+    page = _ready_editor()
+    page.visible["button:has-text('확인')"] = True
+    intercepted = {"done": False}
+
+    async def intercept(selector: str, timeout: int | None) -> None:
+        if selector != ".se-documentTitle .se-text-paragraph" or intercepted["done"]:
+            return
+        intercepted["done"] = True
+        page.visible[".se-popup-button-cancel"] = True
+        raise PlaywrightTimeout(
+            f'{selector} <div class="se-container"> intercepts pointer events'
+        )
+
+    page.before_click = intercept
+
+    await fill_post_title(page, "제목")
+
+    title_timeouts = [
+        timeout
+        for selector, timeout in page.click_timeouts
+        if selector == ".se-documentTitle .se-text-paragraph"
+    ]
+    assert title_timeouts
+    assert all(timeout is not None and timeout < 30000 for timeout in title_timeouts)
+    assert ".se-popup-button-cancel" in page.clicked
     assert "button:has-text('확인')" not in page.clicked
     assert page.typed == ["제목"]
 

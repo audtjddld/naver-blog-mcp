@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import re
+import weakref
 from typing import Optional, Dict, Any
 
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeout
@@ -19,6 +20,14 @@ logger = logging.getLogger(__name__)
 
 # 줄이 URL로 끝나면 스마트에디터 ONE이 OG 링크 카드로 바꾸고 다음 줄과 붙인다.
 _URL_AT_LINE_END = re.compile(r"https?://\S+$", re.IGNORECASE)
+# '작성 중인 글이 있습니다'는 제목 노드보다 늦게 붙는다. 그 전에 한 번만 보면 놓친다.
+CONTINUE_POPUP_WAIT_S = 6.0
+CONTINUE_POPUP_POLL_S = 0.5
+# 기본 30초는 모달이 클릭을 가로막을 때 그대로 낭비된다.
+EDITOR_CLICK_TIMEOUT_MS = 5000
+_late_popup_waited: "weakref.WeakKeyDictionary[object, bool]" = (
+    weakref.WeakKeyDictionary()
+)
 
 
 class NaverBlogPostError(Exception):
@@ -75,23 +84,103 @@ async def find_visible(page: Page, selectors: object):
     return None, None, None
 
 
-async def dismiss_write_popups(page: Page, rounds: int = 2) -> None:
+def _click_blocked(exc: BaseException) -> bool:
+    """모달이 포인터를 가로채면 Playwright는 타임아웃까지 클릭을 붙잡는다."""
+    if isinstance(exc, PlaywrightTimeout):
+        return True
+    return "intercepts pointer events" in str(exc)
+
+
+def _forget_continue_popup(page: Page) -> None:
+    try:
+        _late_popup_waited.pop(page, None)
+    except TypeError:
+        return
+
+
+def _mark_continue_popup_waited(page: Page) -> None:
+    try:
+        _late_popup_waited[page] = True
+    except TypeError:
+        return
+
+
+def _continue_popup_waited(page: Page) -> bool:
+    try:
+        return bool(_late_popup_waited.get(page))
+    except TypeError:
+        return False
+
+
+async def dismiss_write_popups(page: Page, rounds: int = 2) -> bool:
     """'작성 중인 글 이어쓰기'는 취소해야 새 글에 입력된다.
 
     확인 버튼은 이어쓰기를 수락하므로 누르지 않는다.
+    보이는 취소 버튼을 눌렀으면 True.
     """
     selectors = NaverSelectors.POST_WRITE["popup_dismiss"]
+    dismissed = False
     for _ in range(rounds):
         _frame, element, selector = await find_visible(page, selectors)
         if element is None:
-            return
+            return dismissed
         try:
-            await element.click()
-            logger.info("글쓰기 팝업 닫기: %s", selector)
+            await element.click(timeout=EDITOR_CLICK_TIMEOUT_MS)
+            dismissed = True
+            logger.info("글쓰기 팝업 닫기(취소): %s", selector)
         except Exception as exc:
             logger.info("글쓰기 팝업 닫기 실패(무시): %s", exc)
-            return
+            return dismissed
         await _sleep(0.2)
+    return dismissed
+
+
+async def wait_for_continue_draft_popup(
+    page: Page, timeout_s: float = CONTINUE_POPUP_WAIT_S
+) -> bool:
+    """제목이 보인 뒤에 뜨는 이어쓰기 모달을 잠시 기다렸다가 취소한다.
+
+    모달이 보이면 바로 취소하고, 아직 없으면 timeout_s 까지 다시 본다.
+    """
+    polls = max(1, int(timeout_s / CONTINUE_POPUP_POLL_S))
+    for _ in range(polls):
+        if await dismiss_write_popups(page):
+            await _sleep(0.3)
+            await dismiss_write_popups(page)
+            return True
+        await _sleep(CONTINUE_POPUP_POLL_S)
+    return False
+
+
+async def ensure_continue_popup_cleared(page: Page) -> None:
+    """글마다 한 번은 늦은 모달을 기다리고, 그 다음 클릭 전에는 다시 닫기만 한다."""
+    if _continue_popup_waited(page):
+        await dismiss_write_popups(page)
+        return
+    await wait_for_continue_draft_popup(page)
+    _mark_continue_popup_waited(page)
+
+
+async def click_editor_target(page: Page, selectors: object, *, what: str) -> str:
+    """보이는 편집 영역을 짧게 클릭한다.
+
+    모달이 포인터를 가로채면 30초를 기다리지 않고 취소를 누른 뒤 다시 클릭한다.
+    """
+    last_error: Optional[BaseException] = None
+    for _ in range(3):
+        await dismiss_write_popups(page)
+        _frame, element, selector = await find_visible(page, selectors)
+        if element is None:
+            raise NaverBlogPostError(f"{what} 입력란을 찾을 수 없습니다.")
+        try:
+            await element.click(timeout=EDITOR_CLICK_TIMEOUT_MS)
+            return selector
+        except Exception as exc:
+            if not _click_blocked(exc):
+                raise
+            last_error = exc
+            logger.info("%s 클릭이 팝업에 가려 취소 후 재시도합니다.", what)
+    raise NaverBlogPostError(f"{what} 클릭이 이어쓰기 팝업에 막혔습니다: {last_error}")
 
 
 def prepare_editor_line(line: str) -> str:
@@ -127,6 +216,7 @@ async def navigate_to_post_write_page(
         else:
             url = "https://blog.naver.com/postwrite"
 
+        _forget_continue_popup(page)
         await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
 
         for _ in range(8):
@@ -173,11 +263,8 @@ async def fill_post_title(page: Page, title: str) -> None:
         NaverBlogPostError: 제목 입력 실패 시
     """
     try:
-        await dismiss_write_popups(page)
-        _frame, element, selector = await find_visible(page, POST_WRITE_TITLE)
-        if element is None:
-            raise NaverBlogPostError("제목 입력란을 찾을 수 없습니다.")
-        await element.click()
+        await ensure_continue_popup_cleared(page)
+        selector = await click_editor_target(page, POST_WRITE_TITLE, what="제목")
         await _sleep(0.3)
         await page.keyboard.type(title, delay=20)
         logger.info("제목 입력 완료: %s (%s)", title, selector)
@@ -199,12 +286,8 @@ async def fill_post_content(page: Page, content: str, use_html: bool = False) ->
     if use_html:
         logger.info("스마트에디터 ONE은 HTML 모드가 없어 텍스트로 입력합니다.")
     try:
-        await dismiss_write_popups(page)
-        _frame, element, selector = await find_visible(page, POST_WRITE_CONTENT_BODY)
-        if element is None:
-            raise NaverBlogPostError("본문 입력 영역을 찾을 수 없습니다.")
-
-        await element.click()
+        await ensure_continue_popup_cleared(page)
+        selector = await click_editor_target(page, POST_WRITE_CONTENT_BODY, what="본문")
         await _sleep(0.3)
         lines = content.split("\n")
         for index, line in enumerate(lines):

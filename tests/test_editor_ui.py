@@ -278,28 +278,58 @@ async def test_blank_lines_become_enter_without_insert() -> None:
     assert page.pressed == ["Enter", "Enter"]
 
 
+class _AutolinkKeyboard(_Keyboard):
+    """URL로 끝나는 단락의 첫 Enter 는 자동링크가 삼킨다."""
+
+    async def insert_text(self, text: str) -> None:
+        await super().insert_text(text)
+        self._page.paragraphs[-1] += text
+        if text.rstrip().startswith("http") or "https://" in text or "http://" in text:
+            if text.rstrip().split()[-1].startswith("http"):
+                self._page.autolink_armed = True
+
+    async def press(self, key: str) -> None:
+        await super().press(key)
+        if key == "Escape":
+            return
+        if key != "Enter":
+            return
+        if self._page.autolink_armed:
+            self._page.autolink_armed = False
+            return
+        self._page.paragraphs.append("")
+
+
+class _AutolinkPage(EditorPage):
+    def __init__(self) -> None:
+        super().__init__()
+        self.paragraphs = [""]
+        self.autolink_armed = False
+        self.keyboard = _AutolinkKeyboard(self)
+        self.visible[".se-component.se-text .se-text-paragraph"] = True
+
+    async def evaluate(self, expression: str, *_args: object) -> str | None:
+        if "se-text-paragraph" not in expression:
+            return None
+        return self.paragraphs[-1]
+
+
 @pytest.mark.asyncio
-async def test_url_line_is_inserted_unchanged_before_the_next_line() -> None:
-    """URL 줄 끝에 문자를 붙이면 접두어가 지워지고 주소가 다음 줄 끝으로 붙는다."""
-    page = EditorPage()
-    page.visible[".se-component.se-text .se-text-paragraph"] = True
-    body = (
-        "MCP 수정 후 동작 확인용 임시저장 글입니다.\n"
-        "둘째 줄입니다.\n"
-        "출처 예시: https://www.cdc.gov/ncbddd/actearly/milestones/milestones-15mo.html\n"
-        "링크 다음 줄이 따로 떨어져 있어야 합니다."
-    )
-
-    await fill_post_content(page, body)
-
-    assert page.inserted == [
+async def test_enter_after_url_is_retried_until_the_next_paragraph_starts() -> None:
+    """자동링크가 URL 직후 Enter 를 삼켜도 다음 줄은 새 단락에 있어야 한다."""
+    page = _AutolinkPage()
+    lines = [
         "MCP 수정 후 동작 확인용 임시저장 글입니다.",
         "둘째 줄입니다.",
         "출처 예시: https://www.cdc.gov/ncbddd/actearly/milestones/milestones-15mo.html",
         "링크 다음 줄이 따로 떨어져 있어야 합니다.",
     ]
+
+    await fill_post_content(page, "\n".join(lines))
+
+    assert page.inserted == lines
     assert "\u200b" not in "".join(page.inserted)
-    assert page.pressed == ["Enter", "Enter", "Enter"]
+    assert page.paragraphs == lines
 
 
 @pytest.mark.asyncio

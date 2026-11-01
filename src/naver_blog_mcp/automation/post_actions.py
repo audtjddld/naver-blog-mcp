@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 import weakref
 from typing import Optional, Dict, Any
 
@@ -17,6 +18,19 @@ from .selectors import (
 
 logger = logging.getLogger(__name__)
 
+# URL로 끝나는 줄의 Enter 는 자동링크/OG 카드가 삼킨다.
+_URL_AT_LINE_END = re.compile(r"https?://\S+$", re.IGNORECASE)
+_CARET_PARAGRAPH_JS = """() => {
+    const selection = window.getSelection && window.getSelection();
+    if (!selection || selection.rangeCount === 0) return null;
+    const node = selection.anchorNode;
+    if (!node) return null;
+    const element = node.nodeType === 1 ? node : node.parentElement;
+    if (!element || !element.closest) return null;
+    const paragraph = element.closest(".se-text-paragraph");
+    if (!paragraph) return null;
+    return (paragraph.innerText || "").replace(/\\u200b/g, "").trim();
+}"""
 # '작성 중인 글이 있습니다'는 제목 노드보다 늦게 붙는다. 그 전에 한 번만 보면 놓친다.
 CONTINUE_POPUP_WAIT_S = 6.0
 CONTINUE_POPUP_POLL_S = 0.5
@@ -180,6 +194,62 @@ async def click_editor_target(page: Page, selectors: object, *, what: str) -> st
     raise NaverBlogPostError(f"{what} 클릭이 이어쓰기 팝업에 막혔습니다: {last_error}")
 
 
+def _line_ends_with_url(line: str) -> bool:
+    return bool(_URL_AT_LINE_END.search(line.rstrip()))
+
+
+async def _caret_paragraph_text(page: Page) -> Optional[str]:
+    """캐럿이 있는 본문 단락의 글자. 읽지 못하면 None."""
+    targets = [page]
+    for frame in _frames_of(page):
+        if frame is not page:
+            targets.append(frame)
+    saw_empty = False
+    for target in targets:
+        evaluate = getattr(target, "evaluate", None)
+        if evaluate is None:
+            continue
+        try:
+            text = await evaluate(_CARET_PARAGRAPH_JS)
+        except Exception:
+            continue
+        if not isinstance(text, str):
+            continue
+        if text:
+            return text
+        saw_empty = True
+    if saw_empty:
+        return ""
+    return None
+
+
+async def _break_paragraph(page: Page, line: str) -> None:
+    """한 줄을 끝낸다.
+
+    URL 직후의 Enter 는 자동링크가 확정 키로 먹어 단락이 안 나뉜다.
+    링크 제안은 Escape 로 닫고, 캐럿이 그 URL 단락에 남아 있으면 Enter 를 다시 누른다.
+    """
+    if not _line_ends_with_url(line):
+        await page.keyboard.press("Enter")
+        return
+
+    url = _URL_AT_LINE_END.search(line.rstrip())
+    url_text = url.group(0) if url else ""
+    await _sleep(0.4)
+    await page.keyboard.press("Escape")
+    for attempt in range(3):
+        await page.keyboard.press("Enter")
+        await _sleep(0.25)
+        caret = await _caret_paragraph_text(page)
+        # 링크 카드로 바뀌면 본문 단락을 못 읽는다. 그때는 Enter 를 한 번만 더 누른다.
+        if caret is None:
+            if attempt == 0:
+                continue
+            return
+        if url_text not in caret:
+            return
+
+
 async def navigate_to_post_write_page(
     page: Page, blog_id: Optional[str] = None, timeout: int = 30000
 ) -> None:
@@ -278,14 +348,13 @@ async def fill_post_content(page: Page, content: str, use_html: bool = False) ->
         await ensure_continue_popup_cleared(page)
         selector = await click_editor_target(page, POST_WRITE_CONTENT_BODY, what="본문")
         await _sleep(0.3)
-        # 줄은 있는 그대로 넣는다. URL 끝에 U+200B를 붙이면 스마트에디터가
-        # 접두어(출처 예시:)를 지우고 주소를 다음 줄 끝에 붙인다.
+        # 줄은 있는 그대로 넣는다. URL 끝에 U+200B를 붙이면 접두어가 지워진다.
         lines = content.split("\n")
         for index, line in enumerate(lines):
             if line:
                 await page.keyboard.insert_text(line)
             if index < len(lines) - 1:
-                await page.keyboard.press("Enter")
+                await _break_paragraph(page, line)
         logger.info("본문 입력 완료 (%s)", selector)
         await _sleep(0.5)
     except NaverBlogPostError:

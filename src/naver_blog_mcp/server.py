@@ -6,7 +6,6 @@ MCP (Model Context Protocol) 서버를 제공합니다.
 
 import asyncio
 import logging
-import os
 from typing import Optional
 
 from mcp.server import Server
@@ -14,10 +13,10 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
-from .config import config
+from .config import config, login_id
 from .automation.browser import launch_browser, new_browser_context
-from .services.session_manager import SessionManager
-from .automation.login import verify_login_session
+from .services.session_manager import SessionManager, session_reuse_action
+from .automation.login import inspect_login_state, verify_login_session
 from .mcp.tools import (
     TOOLS_METADATA,
     handle_create_post,
@@ -35,6 +34,31 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def page_is_open(page: object) -> bool:
+    """True when the page has no closed flag or is still open."""
+    is_closed = getattr(page, "is_closed", None)
+    if not callable(is_closed):
+        return True
+    try:
+        return not bool(is_closed())
+    except Exception:
+        return True
+
+
+def preferred_page(pages, pinned):
+    """Keep the deliberate login page when it is still open.
+
+    Confirm and later tools must use that MCP page, not a probe page and
+    not a separate Chrome window.
+    """
+    if pinned is not None and page_is_open(pinned):
+        return pinned
+    for page in pages:
+        if page_is_open(page):
+            return page
+    return None
+
+
 class NaverBlogMCPServer:
     """네이버 블로그 MCP 서버 클래스."""
 
@@ -44,13 +68,17 @@ class NaverBlogMCPServer:
         self.playwright = None
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
+        self._login_page: Optional[Page] = None
 
         # 설정 검증
         config.validate()
 
         # 세션 관리자 초기화
         self.session_manager = SessionManager(
-            user_id=config.NAVER_BLOG_ID, password=config.NAVER_BLOG_PASSWORD
+            user_id=login_id(),
+            password=config.NAVER_BLOG_PASSWORD,
+            storage_path=config.SESSION_STORAGE_PATH,
+            session_validity_hours=config.SESSION_VALIDITY_HOURS,
         )
 
         # Tool 등록
@@ -83,9 +111,10 @@ class NaverBlogMCPServer:
                 if name == "naver_blog_login":
                     await self.reset_browser_for_login()
                     page = await self.get_page()
+                    self._login_page = page
                     result = await handle_login(
                         page,
-                        config.NAVER_BLOG_ID,
+                        login_id(),
                         config.NAVER_BLOG_PASSWORD,
                     )
                     return _text(result)
@@ -193,27 +222,45 @@ class NaverBlogMCPServer:
             self.browser = await launch_browser(self.playwright)
             logger.info("Browser launched (headless=%s)", config.HEADLESS)
 
-        # 저장된 세션이 유효하면 재사용
+        # 저장된 세션 파일이 있으면 이 브라우저 컨텍스트로만 복원한다.
+        # 확인에 실패해도 파일은 지우지 않는다. 프로브가 실패하면 컨텍스트를 유지한다.
         if self.session_manager.is_session_file_valid():
             ctx = None
+            probe = None
+            state = {"logged_in": False, "status": "unknown"}
             try:
                 ctx = await new_browser_context(
                     self.browser,
                     storage_state=self.session_manager.storage_path,
                 )
-                if await self.session_manager.is_session_valid(ctx):
-                    self.context = ctx
-                    logger.info("저장된 세션 재사용")
-                    return
-                await ctx.close()
-                logger.info("저장된 세션이 만료됨. 미로그인 컨텍스트로 시작.")
-            except Exception as e:
-                if ctx is not None:
+                probe = await ctx.new_page()
+                state = await inspect_login_state(probe)
+            except Exception:
+                logger.warning(
+                    "세션 확인에 실패했습니다. 저장 파일은 유지하고 컨텍스트를 재사용합니다.",
+                    exc_info=True,
+                )
+                state = {"logged_in": False, "status": "unknown"}
+            if ctx is not None and session_reuse_action(state) == "reuse":
+                if probe is not None:
                     try:
-                        await ctx.close()
+                        await probe.close()
                     except Exception:
                         pass
-                logger.warning(f"세션 복원 실패: {e}. 미로그인 컨텍스트로 시작.")
+                self.context = ctx
+                logger.info("저장된 세션 재사용")
+                return
+            if probe is not None:
+                try:
+                    await probe.close()
+                except Exception:
+                    pass
+            if ctx is not None:
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass
+            logger.info("저장된 세션이 로그인 상태가 아닙니다. 세션 파일은 유지합니다.")
 
         # 빈 컨텍스트 (미로그인)
         self.context = await new_browser_context(self.browser)
@@ -225,6 +272,8 @@ class NaverBlogMCPServer:
         2차 인증 입력이 지연되어 기존 창이 stale 해진 경우에도, naver_blog_login을
         다시 호출하면 항상 깨끗한 새 로그인 창에서 시작하도록 한다.
         """
+        # 저장 파일은 지우지 않는다. 이 호출은 메모리의 창만 새로 연다.
+        self._login_page = None
         # 기존 컨텍스트/브라우저 정리
         if self.context:
             try:
@@ -273,12 +322,11 @@ class NaverBlogMCPServer:
         # 브라우저/컨텍스트 보장 (lazy)
         await self.ensure_browser()
 
-        # 기존 페이지가 있으면 재사용, 없으면 새로 생성
-        pages = self.context.pages
-        if pages:
-            return pages[0]
-        else:
-            return await self.context.new_page()
+        pages = list(self.context.pages) if self.context is not None else []
+        chosen = preferred_page(pages, self._login_page)
+        if chosen is not None:
+            return chosen
+        return await self.context.new_page()
 
     async def run(self):
         """MCP 서버 실행."""

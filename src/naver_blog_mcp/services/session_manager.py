@@ -1,7 +1,6 @@
 """네이버 블로그 세션 관리자."""
 
-import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -9,6 +8,19 @@ from playwright.async_api import Browser, BrowserContext
 
 from ..automation.browser import new_browser_context
 from ..automation.login import login_to_naver, verify_login_session, NaverLoginError
+
+
+def session_reuse_action(state: dict) -> str:
+    """Decide whether a loaded storage context stays in memory.
+
+    drop_memory closes only the in-memory context. The storage file stays.
+    unknown means the probe failed, so a valid file must not be discarded.
+    """
+    if state.get("logged_in"):
+        return "reuse"
+    if state.get("status") == "unknown":
+        return "reuse"
+    return "drop_memory"
 
 
 class SessionManager:
@@ -37,25 +49,19 @@ class SessionManager:
         self.last_login_time: Optional[datetime] = None
 
     def is_session_file_valid(self) -> bool:
+        """True when a non-empty session file exists.
+
+        Age is not a logout signal. A 24h mtime gate skipped still-valid
+        Naver cookies and made the next tool start from an empty context.
+        This method does not delete the file.
         """
-        세션 파일이 유효한지 확인합니다.
-
-        Returns:
-            세션 파일 유효 여부
-        """
-        # 1. 파일 존재 여부
-        if not Path(self.storage_path).exists():
+        path = Path(self.storage_path)
+        if not path.is_file():
             return False
-
-        # 2. 파일 수정 시간 확인
-        file_mtime = datetime.fromtimestamp(Path(self.storage_path).stat().st_mtime)
-        elapsed = datetime.now() - file_mtime
-
-        # 설정된 유효 시간 이내인지 확인
-        if elapsed > timedelta(hours=self.session_validity_hours):
+        try:
+            return path.stat().st_size > 0
+        except OSError:
             return False
-
-        return True
 
     async def is_session_valid(self, context: BrowserContext) -> bool:
         """

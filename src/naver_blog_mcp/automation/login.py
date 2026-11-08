@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import urllib.parse
 from pathlib import Path
 from typing import Optional
 
@@ -14,11 +15,38 @@ logger = logging.getLogger(__name__)
 # nid 로그인 직후 blog.naver.com 루트는 section 으로 리다이렉트되며 500 이 잦다.
 # 로그인 완료 랜딩은 section.blog 로 고정한다.
 LOGIN_URL = (
-    "https://nid.naver.com/nidlogin.login"
-    "?url=https%3A%2F%2Fsection.blog.naver.com%2F"
+    "https://nid.naver.com/nidlogin.login?url=https%3A%2F%2Fsection.blog.naver.com%2F"
 )
-SECTION_BLOG_URL = "https://section.blog.naver.com/"
 LOGIN_COOKIE_NAMES = frozenset({"NID_AUT", "NID_SES"})
+# Either cookie is enough. NID_AUT is persistent and NID_SES is the session
+# cookie; requiring both marked a signed-in browser as logged out.
+NAVER_COOKIE_URLS = [
+    "https://www.naver.com/",
+    "https://naver.com/",
+    "https://nid.naver.com/",
+    "https://blog.naver.com/",
+    "https://section.blog.naver.com/",
+]
+TWO_FACTOR_INPUTS = [
+    "input[autocomplete='one-time-code']",
+    "input[name='otp']",
+    "#otp",
+    "input[placeholder*='인증번호']",
+]
+TWO_FACTOR_TEXT = [
+    "text=2단계 인증",
+    "text=2-step verification",
+    "text=2-Step Verification",
+    "text=verification code",
+    "text=Verification code",
+]
+LOGOUT_CONTROLS = [
+    "a[href*='nidlogin.logout']",
+    "button:has-text('로그아웃')",
+    "a:has-text('로그아웃')",
+    "button:has-text('Sign out')",
+    "a:has-text('Logout')",
+]
 MAX_LOGIN_AUTO_CLICKS = 3
 # 헤드풀에서는 사람이 캡차를 풀 시간을 둔다 (약 10분).
 LOGIN_ASSIST_POLLS = 300
@@ -56,16 +84,51 @@ def _selector_list(selectors: object) -> list[str]:
     return list(selectors)  # type: ignore[arg-type]
 
 
-async def _naver_cookie_names(page: Page) -> set[str]:
-    cookies = await page.context.cookies()
-    return {
-        cookie["name"] for cookie in cookies if "naver.com" in cookie.get("domain", "")
-    }
+def _is_naver_auth_cookie(cookie: dict) -> bool:
+    if cookie.get("name") not in LOGIN_COOKIE_NAMES:
+        return False
+    domain = str(cookie.get("domain") or "").lower()
+    if "naver.com" in domain:
+        return True
+    url = str(cookie.get("url") or "").lower()
+    return "naver.com" in url
+
+
+async def _cookie_records(page: Page) -> list[dict]:
+    """Read this context's cookies, including ones scoped to a Naver URL.
+
+    cookies() with no URL can miss a host-only cookie that cookies(urls)
+    still returns. Values stay in the caller and are never logged.
+    """
+    context = page.context
+    records: list[dict] = []
+    try:
+        records.extend(await context.cookies())
+    except Exception:
+        logger.debug("context.cookies() failed", exc_info=True)
+    try:
+        scoped = await context.cookies(NAVER_COOKIE_URLS)
+    except TypeError:
+        scoped = []
+    except Exception:
+        logger.debug("scoped cookies() failed", exc_info=True)
+        scoped = []
+    records.extend(scoped or [])
+    return records
+
+
+async def auth_cookie_names(page: Page) -> set[str]:
+    """Auth cookie names present on this MCP browser context. Never values."""
+    names: set[str] = set()
+    for cookie in await _cookie_records(page):
+        if _is_naver_auth_cookie(cookie):
+            names.add(str(cookie["name"]))
+    return names
 
 
 async def has_login_cookies(page: Page) -> bool:
-    """NID_AUT 와 NID_SES 가 있으면 로그인된 세션이다."""
-    return LOGIN_COOKIE_NAMES <= await _naver_cookie_names(page)
+    """True when NID_AUT or NID_SES belongs to this browser context."""
+    return bool(await auth_cookie_names(page))
 
 
 async def _locator_visible(page: Page, selector: str) -> bool:
@@ -82,6 +145,135 @@ async def captcha_visible(page: Page) -> bool:
         if await _locator_visible(page, selector):
             return True
     return False
+
+
+def _page_host(page: Page) -> str:
+    try:
+        return urllib.parse.urlparse(getattr(page, "url", "") or "").netloc.lower()
+    except Exception:
+        return ""
+
+
+async def two_factor_visible(page: Page) -> bool:
+    """OTP / 2-step UI on the Naver login host. Does not solve it."""
+    for selector in TWO_FACTOR_INPUTS:
+        if await _locator_visible(page, selector):
+            return True
+    if "nid.naver.com" not in _page_host(page):
+        return False
+    for selector in TWO_FACTOR_TEXT:
+        if await _locator_visible(page, selector):
+            return True
+    return False
+
+
+async def _logout_control_visible(page: Page) -> bool:
+    for selector in LOGOUT_CONTROLS:
+        if await _locator_visible(page, selector):
+            return True
+    return False
+
+
+async def _switch_is_on(page: Page, selector: str) -> Optional[bool]:
+    try:
+        checked = await page.locator(selector).first.get_attribute("aria-checked")
+    except Exception:
+        return None
+    if not isinstance(checked, str):
+        return None
+    lowered = checked.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    return None
+
+
+async def ensure_ip_security_off(page: Page) -> str:
+    """Turn the login-form IP Security switch OFF before credentials.
+
+    Returns already_off, turned_off, not_found, or still_on.
+    Does not submit credentials. A missing or still-on switch must block submit.
+    """
+    selector = None
+    for candidate in _selector_list(NaverSelectors.LOGIN["ip_security_switch"]):
+        if await _locator_visible(page, candidate):
+            selector = candidate
+            break
+    if selector is None:
+        return "not_found"
+    state = await _switch_is_on(page, selector)
+    if state is None:
+        return "not_found"
+    if state is False:
+        return "already_off"
+    try:
+        await page.locator(selector).click()
+    except Exception:
+        logger.info("IP security switch could not be clicked")
+        return "still_on"
+    if await _switch_is_on(page, selector) is False:
+        return "turned_off"
+    return "still_on"
+
+
+async def _credentials_landed(page: Page, user_id: str) -> bool:
+    try:
+        current_id = await page.input_value(LOGIN_ID_INPUT)
+        current_pw = await page.input_value(LOGIN_PW_INPUT)
+    except Exception:
+        return False
+    return bool(current_id) and bool(current_pw) and current_id == user_id
+
+
+def public_login_diagnostics(state: dict) -> dict:
+    """Status safe to return to the MCP host. No cookie values or secrets."""
+    parsed = urllib.parse.urlparse(state.get("page_url") or "")
+    return {
+        "status": state.get("status"),
+        "logged_in": bool(state.get("logged_in")),
+        "challenge": state.get("challenge"),
+        "auth_cookie_names": list(state.get("auth_cookie_names") or []),
+        "page_host": parsed.netloc,
+        "page_path": parsed.path,
+        "browser_owner": "mcp_playwright_context",
+    }
+
+
+async def inspect_login_state(page: Page) -> dict:
+    """Describe this MCP page without navigating away from it.
+
+    A challenge wins over stale auth cookies. A regular Chrome window is a
+    different cookie jar and is not consulted.
+    """
+    try:
+        names = sorted(await auth_cookie_names(page))
+        if await captcha_visible(page):
+            status, challenge, logged_in = "awaiting_captcha", "captcha", False
+        elif await two_factor_visible(page):
+            status, challenge, logged_in = "awaiting_2fa", "2fa", False
+        elif names or await _logout_control_visible(page):
+            status, challenge, logged_in = "authenticated", None, True
+        elif await _locator_visible(page, LOGIN_ID_INPUT):
+            status, challenge, logged_in = "login_form", None, False
+        else:
+            status, challenge, logged_in = "logged_out", None, False
+        return {
+            "logged_in": logged_in,
+            "status": status,
+            "challenge": challenge,
+            "auth_cookie_names": names,
+            "page_url": getattr(page, "url", "") or "",
+        }
+    except Exception:
+        logger.warning("login state inspection failed", exc_info=True)
+        return {
+            "logged_in": False,
+            "status": "unknown",
+            "challenge": None,
+            "auth_cookie_names": [],
+            "page_url": getattr(page, "url", "") or "",
+        }
 
 
 async def _open_login_page(page: Page) -> None:
@@ -130,11 +322,29 @@ async def refill_credentials_if_cleared(
     except Exception:
         current_id = ""
     if not current_id:
-        await page.locator(LOGIN_ID_INPUT).click()
-        await page.keyboard.type(user_id, delay=80)
-    await page.locator(LOGIN_PW_INPUT).click()
-    await page.keyboard.type(password, delay=80)
-    return True
+        await _type_secret(page, LOGIN_ID_INPUT, user_id)
+    await _type_secret(page, LOGIN_PW_INPUT, password)
+    if await _credentials_landed(page, user_id):
+        return True
+    try:
+        if not await page.input_value(LOGIN_ID_INPUT):
+            await page.locator(LOGIN_ID_INPUT).fill(user_id)
+        if not await page.input_value(LOGIN_PW_INPUT):
+            await page.locator(LOGIN_PW_INPUT).fill(password)
+    except Exception:
+        return False
+    return await _credentials_landed(page, user_id)
+
+
+async def _type_secret(page: Page, selector: str, text: str) -> None:
+    """Type into a login field. The text is never logged."""
+    await page.locator(selector).click()
+    try:
+        await page.keyboard.press("Control+A")
+        await page.keyboard.press("Delete")
+    except Exception:
+        pass
+    await page.keyboard.type(text, delay=80)
 
 
 async def assist_login_once(
@@ -153,14 +363,22 @@ async def assist_login_once(
     if await has_login_cookies(page):
         return clicks
 
+    if await two_factor_visible(page):
+        logger.info("2단계 인증 화면입니다. 자동 클릭하지 않습니다.")
+        return clicks
+
     refilled = await refill_credentials_if_cleared(page, user_id, password)
     if not refilled:
         return clicks
 
-    if await captcha_visible(page):
+    if await captcha_visible(page) or await two_factor_visible(page):
         logger.info(
-            "캡차가 보입니다. 정답은 사용자가 입력합니다. 자동 클릭하지 않습니다."
+            "캡차 또는 2단계 인증이 보입니다. 정답은 사용자가 입력합니다. 자동 클릭하지 않습니다."
         )
+        return clicks
+
+    if not await _credentials_landed(page, user_id):
+        logger.info("로그인 칸이 비어 있습니다. 로그인 버튼을 누르지 않습니다.")
         return clicks
 
     if clicks >= max_auto_clicks:
@@ -200,6 +418,10 @@ async def run_login_assist(
         for _ in range(max_polls):
             if await has_login_cookies(page):
                 return True
+            if headless and await two_factor_visible(page):
+                raise NaverLoginError(
+                    "2단계 인증이 필요합니다. HEADLESS=false에서 사용자가 직접 완료해야 합니다."
+                )
             if headless and await captcha_visible(page):
                 raise CaptchaDetectedError(
                     "CAPTCHA가 감지되었습니다. HEADLESS=false로 설정하고 수동으로 풀어주세요."
@@ -214,6 +436,10 @@ async def run_login_assist(
             if await has_login_cookies(page):
                 return True
             await _sleep(interval)
+        if headless and await two_factor_visible(page):
+            raise NaverLoginError(
+                "2단계 인증이 필요합니다. HEADLESS=false에서 사용자가 직접 완료해야 합니다."
+            )
         if headless and await captcha_visible(page):
             raise CaptchaDetectedError(
                 "CAPTCHA가 감지되었습니다. HEADLESS=false로 설정하고 수동으로 풀어주세요."
@@ -228,6 +454,13 @@ async def run_login_assist(
         return False
 
 
+def cancel_login_assist() -> None:
+    """Stop background credential refill so confirm cannot race a click."""
+    for task in list(_assist_tasks):
+        if not task.done():
+            task.cancel()
+
+
 def schedule_login_assist(
     page: Page,
     user_id: str,
@@ -235,9 +468,7 @@ def schedule_login_assist(
     initial_clicks: int = 0,
 ) -> asyncio.Task:
     """MCP 도구가 반환된 뒤에도 캡차 후 비밀번호 재입력을 이어 간다."""
-    for task in list(_assist_tasks):
-        if not task.done():
-            task.cancel()
+    cancel_login_assist()
 
     task = asyncio.create_task(
         run_login_assist(
@@ -266,39 +497,89 @@ async def _visible_error_message(page: Page) -> Optional[str]:
     return None
 
 
-async def start_login(page: Page, user_id: str, password: str) -> None:
-    """네이버 로그인 페이지에서 ID/PW 제출을 시작한다.
+def _login_outcome(status: str, *, submitted: bool, ip_security: str) -> dict:
+    return {
+        "status": status,
+        "credentials_submitted": submitted,
+        "ip_security": ip_security,
+    }
 
-    호출은 바로 반환된다. 영수증 캡차 때문에 비밀번호가 지워지면 백그라운드
-    루프가 몇 번까지 다시 채우고, 캡차 답과 그 이후의 클릭은 사용자가 한다.
-    완료 여부는 verify_login_session 또는 naver_blog_confirm_login 으로 확인한다.
 
-    Raises:
-        NaverLoginError: 로그인 페이지/버튼 처리 실패 시
+async def start_login(page: Page, user_id: str, password: str) -> dict:
+    """Start a deliberate login on this MCP page.
+
+    IP Security is switched OFF before credentials are typed. A challenge,
+    a missing button, or fields that stay empty is not reported as a submit.
+    The page is not navigated away to blog home.
+
+    Returns:
+        status, credentials_submitted, ip_security. No secrets.
     """
     try:
+        cancel_login_assist()
         await _open_login_page(page)
+        ip_state = await ensure_ip_security_off(page)
+        if ip_state not in {"already_off", "turned_off"}:
+            logger.info(
+                "IP security is not confirmed off (%s). Not submitting.", ip_state
+            )
+            return _login_outcome(
+                "ip_security_not_confirmed_off",
+                submitted=False,
+                ip_security=ip_state,
+            )
+
+        if await two_factor_visible(page):
+            return _login_outcome("awaiting_2fa", submitted=False, ip_security=ip_state)
+
         clicks = await assist_login_once(
             page,
             user_id,
             password,
             clicks=0,
-            require_button=True,
+            require_button=False,
         )
-        if (
-            clicks == 0
-            and not await has_login_cookies(page)
-            and not await captcha_visible(page)
-            and not await _locator_visible(page, LOGIN_PW_INPUT)
-        ):
-            raise NaverLoginError("로그인 폼을 찾지 못했습니다.")
+        submitted = clicks > 0
+
+        if await two_factor_visible(page):
+            if submitted:
+                schedule_login_assist(page, user_id, password, initial_clicks=clicks)
+            return _login_outcome(
+                "awaiting_2fa", submitted=submitted, ip_security=ip_state
+            )
+        if await captcha_visible(page):
+            schedule_login_assist(page, user_id, password, initial_clicks=clicks)
+            return _login_outcome(
+                "awaiting_captcha", submitted=submitted, ip_security=ip_state
+            )
+        if await has_login_cookies(page):
+            return _login_outcome(
+                "authenticated", submitted=submitted, ip_security=ip_state
+            )
+        if not await _credentials_landed(page, user_id):
+            if not await _locator_visible(page, LOGIN_PW_INPUT):
+                return _login_outcome(
+                    "login_form_not_found", submitted=False, ip_security=ip_state
+                )
+            return _login_outcome(
+                "credentials_not_entered", submitted=False, ip_security=ip_state
+            )
+        if clicks == 0:
+            return _login_outcome(
+                "login_button_not_found", submitted=False, ip_security=ip_state
+            )
 
         schedule_login_assist(page, user_id, password, initial_clicks=clicks)
-        logger.info("로그인 정보 제출 완료. 2차 인증/CAPTCHA는 사용자 확인 대기.")
+        logger.info(
+            "Credentials submitted. Waiting for the user if a challenge appears."
+        )
+        return _login_outcome(
+            "credentials_submitted", submitted=True, ip_security=ip_state
+        )
     except NaverLoginError:
         raise
     except Exception as e:
-        raise NaverLoginError(f"로그인 시작 중 오류 발생: {str(e)}")
+        raise NaverLoginError(f"로그인 시작 중 오류 발생: {type(e).__name__}")
 
 
 async def login_to_naver(
@@ -340,6 +621,11 @@ async def login_to_naver(
 
     try:
         await _open_login_page(page)
+        ip_state = await ensure_ip_security_off(page)
+        if ip_state not in {"already_off", "turned_off"}:
+            raise NaverLoginError(
+                "IP보안을 끄지 못해 로그인 정보를 제출하지 않았습니다."
+            )
         logged_in = await run_login_assist(
             page,
             user_id,
@@ -360,7 +646,7 @@ async def login_to_naver(
         if not await has_login_cookies(page):
             raise NaverLoginError("로그인 후 세션 확인에 실패했습니다. (쿠키 없음)")
 
-        logger.info("로그인 확인: NID_AUT/NID_SES 쿠키")
+        logger.info("로그인 확인: NID_AUT 또는 NID_SES 쿠키")
         return {
             "success": True,
             "message": "로그인에 성공했습니다.",
@@ -380,38 +666,14 @@ async def login_to_naver(
 
 
 async def verify_login_session(page: Page) -> bool:
+    """True when this MCP context is authenticated.
+
+    Does not navigate. Moving the login page to section.blog.naver.com
+    showed a logged-out BlogHome and discarded an in-progress sign-in.
+    A challenge is not authenticated even if a stale auth cookie exists.
     """
-    현재 세션이 로그인 상태인지 확인합니다.
-
-    NID_AUT 와 NID_SES 가 있으면 blog.naver.com 으로 이동하지 않는다.
-    그 페이지는 500 을 내는 경우가 있어, 이동 결과에만 의존하면
-    로그인된 세션을 미로그인으로 오판한다.
-    """
-    try:
-        if await has_login_cookies(page):
-            return True
-
-        await page.goto(
-            SECTION_BLOG_URL,
-            wait_until="domcontentloaded",
-            timeout=15000,
-        )
-        await _sleep(1)
-
-        if "nid.naver.com" in page.url:
-            return False
-
-        if await has_login_cookies(page):
-            return True
-
-        # section.blog.naver.com 도 호스트에 blog.naver.com 이 포함된다.
-        if "blog.naver.com" in page.url:
-            cookies = await page.context.cookies()
-            return any(cookie["name"] == "NID_AUT" for cookie in cookies)
-
-        return False
-    except Exception:
-        return False
+    state = await inspect_login_state(page)
+    return bool(state["logged_in"])
 
 
 async def logout_from_naver(page: Page) -> None:

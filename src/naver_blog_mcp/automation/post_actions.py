@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import re
+import urllib.parse
 import weakref
 from typing import Optional, Dict, Any
 
@@ -36,16 +37,68 @@ class NaverBlogPostError(Exception):
     pass
 
 
+class WrongBlogError(NaverBlogPostError):
+    """Editor URL belongs to a blog other than the configured publish target."""
+
+    pass
+
+
+_RESERVED_BLOG_PATHS = {
+    "postwrite",
+    "postlist",
+    "postview",
+    "myblog",
+    "bloghome.naver",
+    "postwriteform.naver",
+    "postlist.naver",
+    "redirect",
+}
+
+
+def blog_id_from_url(url: str) -> Optional[str]:
+    """Return the blog id in a blog.naver.com URL, if the path has one."""
+    if not url:
+        return None
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.netloc or "").lower()
+    if "blog.naver.com" not in host:
+        return None
+    query = urllib.parse.parse_qs(parsed.query)
+    for key in ("blogId", "blog_id"):
+        values = query.get(key) or []
+        if values and str(values[0]).strip():
+            return str(values[0]).strip()
+    parts = [part for part in parsed.path.split("/") if part]
+    if not parts:
+        return None
+    candidate = parts[0].strip()
+    lowered = candidate.lower()
+    if lowered in _RESERVED_BLOG_PATHS or lowered.endswith(".naver"):
+        return None
+    return candidate
+
+
+def _reject_mismatched_blog(url: str, expected: Optional[str]) -> None:
+    if not expected:
+        return
+    actual = blog_id_from_url(url)
+    if actual and actual.lower() != expected.lower():
+        raise WrongBlogError(
+            "글쓰기 페이지가 설정된 발행 블로그"
+            f"({expected})가 아닌 {actual} 입니다. 글을 쓰지 않았습니다."
+        )
+
+
 async def _sleep(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
 
 def _configured_blog_id() -> Optional[str]:
-    """로그인 아이디와 같은 블로그 아이디. 없으면 None."""
+    """Publish target. NAVER_PUBLISH_BLOG_ID, else NAVER_BLOG_ID."""
     try:
-        from ..config import config
+        from ..config import publish_blog_id
 
-        blog_id = (config.NAVER_BLOG_ID or "").strip()
+        blog_id = publish_blog_id()
     except Exception:
         return None
     return blog_id or None
@@ -234,6 +287,7 @@ async def navigate_to_post_write_page(
 
         current_url = page.url
         logger.info("글쓰기 페이지 URL: %s", current_url)
+        _reject_mismatched_blog(current_url, blog_id)
         if (
             "postwrite" in current_url.lower()
             or "PostWriteForm" in current_url

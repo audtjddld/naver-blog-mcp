@@ -28,7 +28,11 @@ from naver_blog_mcp.automation import login as login_mod
 from naver_blog_mcp.automation import post_actions
 from naver_blog_mcp.automation.login import assist_login_once, start_login
 from naver_blog_mcp.config import Config
-from naver_blog_mcp.mcp.tools import handle_confirm_login, handle_create_post, handle_login
+from naver_blog_mcp.mcp.tools import (
+    handle_confirm_login,
+    handle_create_post,
+    handle_login,
+)
 from naver_blog_mcp.services.session_manager import SessionManager
 
 
@@ -93,7 +97,9 @@ class _Context:
 
     async def cookies(self, urls: list[str] | None = None) -> list[dict]:
         if urls is None:
-            return [cookie for cookie in self._page.cookies if not cookie.get("url_only")]
+            return [
+                cookie for cookie in self._page.cookies if not cookie.get("url_only")
+            ]
         return list(self._page.cookies)
 
     async def storage_state(self, path: str | None = None) -> dict:
@@ -208,14 +214,24 @@ async def test_old_storage_file_is_still_eligible_for_reuse(tmp_path: Path) -> N
 async def test_unknown_probe_keeps_loaded_session_and_file() -> None:
     from naver_blog_mcp.services.session_manager import session_reuse_action
 
-    assert session_reuse_action({"logged_in": True, "status": "authenticated"}) == "reuse"
+    assert (
+        session_reuse_action({"logged_in": True, "status": "authenticated"}) == "reuse"
+    )
     assert session_reuse_action({"logged_in": False, "status": "unknown"}) == "reuse"
-    assert session_reuse_action({"logged_in": False, "status": "logged_out"}) == "drop_memory"
-    assert session_reuse_action({"logged_in": False, "status": "awaiting_2fa"}) == "drop_memory"
+    assert (
+        session_reuse_action({"logged_in": False, "status": "logged_out"})
+        == "drop_memory"
+    )
+    assert (
+        session_reuse_action({"logged_in": False, "status": "awaiting_2fa"})
+        == "drop_memory"
+    )
 
 
 @pytest.mark.asyncio
-async def test_login_id_and_publish_blog_are_different_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_login_id_and_publish_blog_are_different_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("NAVER_LOGIN_ID", "login-user")
     monkeypatch.setenv("NAVER_PUBLISH_BLOG_ID", "kkforgg")
     monkeypatch.setenv("NAVER_BLOG_PASSWORD", "test-password")
@@ -306,7 +322,9 @@ async def test_two_factor_is_not_marked_authenticated(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_logged_out_confirm_does_not_move_or_erase_storage(tmp_path: Path) -> None:
+async def test_logged_out_confirm_does_not_move_or_erase_storage(
+    tmp_path: Path,
+) -> None:
     page = FlowPage()
     page.url = "https://nid.naver.com/nidlogin.login"
     page.cookies = [{"name": "NNB", "value": "tracker", "domain": ".naver.com"}]
@@ -354,7 +372,9 @@ async def test_english_ip_security_label_is_turned_off_before_submit() -> None:
 
     assert result.get("ip_security") == "turned_off"
     assert ("click", selector) in page.events
-    assert page.events.index(("click", selector)) < page.events.index(("type", "login-user"))
+    assert page.events.index(("click", selector)) < page.events.index(
+        ("type", "login-user")
+    )
 
 
 @pytest.mark.asyncio
@@ -423,7 +443,9 @@ async def test_create_post_stops_when_editor_opens_a_different_blog(
     page.visible[".se-component.se-text .se-text-paragraph"] = True
     page.visible["button[class*='save_btn']"] = True
 
-    async def goto(url: str, wait_until: str | None = None, timeout: int | None = None) -> None:
+    async def goto(
+        url: str, wait_until: str | None = None, timeout: int | None = None
+    ) -> None:
         page.goto_calls.append(url)
         page.url = "https://blog.naver.com/kkforgg/postwrite"
 

@@ -14,7 +14,13 @@ from ..automation.post_actions import create_blog_post, NaverBlogPostError
 from ..automation.image_upload import upload_images
 from ..automation.category_actions import get_categories
 from ..automation.read_actions import list_posts, read_post
-from ..automation.login import start_login, verify_login_session
+from ..automation.login import (
+    cancel_login_assist,
+    inspect_login_state,
+    public_login_diagnostics,
+    start_login,
+)
+from ..config import login_id, publish_blog_id
 from ..utils.retry import retry_on_error
 from ..utils.error_handler import handle_playwright_error
 from ..utils.exceptions import NaverBlogError, UploadError
@@ -25,10 +31,11 @@ TOOLS_METADATA = {
     "naver_blog_login": {
         "name": "naver_blog_login",
         "description": (
-            "네이버 로그인을 시작합니다. 기존 창을 닫고 새 브라우저 창을 열어 ID/PW를 제출합니다. "
-            "영수증 캡차나 2차 인증이 있으면 사용자가 브라우저에서 답을 입력합니다. "
-            "캡차 후 비밀번호가 지워지면 자동으로 다시 채웁니다. "
-            "완료 여부를 사용자에게 물어본 뒤 naver_blog_confirm_login으로 확인하세요."
+            "이 MCP 브라우저에서 네이버 로그인을 시작합니다. "
+            "IP보안이 꺼진 뒤에만 설정된 로그인 아이디와 비밀번호를 제출합니다. "
+            "캡차나 2단계 인증은 사용자가 그 브라우저에서 직접 완료합니다. "
+            "credentials_submitted가 true가 아니면 자격 증명을 제출한 것이 아닙니다. "
+            "완료 후 naver_blog_confirm_login으로 이 브라우저의 세션만 확인하세요."
         ),
         "inputSchema": {
             "type": "object",
@@ -39,8 +46,9 @@ TOOLS_METADATA = {
     "naver_blog_confirm_login": {
         "name": "naver_blog_confirm_login",
         "description": (
-            "사용자가 2차 인증까지 로그인을 완료했는지 확인하고, 성공 시 세션을 저장합니다. "
-            "사용자가 '로그인 완료/네'라고 답한 뒤 호출하세요."
+            "이 MCP 브라우저 컨텍스트의 로그인만 확인합니다. 다른 Chrome 창은 보지 않습니다. "
+            "NID_AUT 또는 NID_SES가 있고 캡차/2단계 인증 화면이 아니면 세션 파일을 저장합니다. "
+            "실패해도 기존 세션 파일은 지우지 않고, 로그인 페이지를 블로그 홈으로 옮기지 않습니다."
         ),
         "inputSchema": {
             "type": "object",
@@ -176,24 +184,57 @@ async def handle_login(page: Page, user_id: str, password: str) -> Dict[str, Any
     """
     logger.info("네이버 로그인 시작")
     try:
-        await start_login(page, user_id, password)
-        return {
-            "success": True,
-            "status": "login_started",
-            "message": (
-                "새 로그인 창에서 아이디/비밀번호를 제출했습니다. "
-                "영수증 캡차나 2차 인증이 뜨면 브라우저에서 답을 입력해 주세요. "
-                "캡차 후 비밀번호가 지워지면 자동으로 다시 채웁니다. "
-                "완료되면 '네/완료'라고 알려주시면 naver_blog_confirm_login으로 확인합니다."
-            ),
-        }
+        outcome = await start_login(page, user_id, password)
     except Exception as e:
-        logger.error(f"로그인 시작 실패: {e}", exc_info=True)
+        logger.error("로그인 시작 실패: %s", type(e).__name__, exc_info=True)
         return {
             "success": False,
             "status": "login_error",
-            "message": f"로그인 시작 실패: {str(e)}",
+            "credentials_submitted": False,
+            "message": f"로그인 시작 실패: {type(e).__name__}",
         }
+
+    status = str(outcome.get("status") or "login_error")
+    submitted = bool(outcome.get("credentials_submitted"))
+    payload = {
+        "status": status,
+        "credentials_submitted": submitted,
+        "ip_security": outcome.get("ip_security"),
+    }
+    messages = {
+        "credentials_submitted": (
+            "아이디/비밀번호를 제출했습니다. "
+            "2단계 인증이나 캡차가 보이면 이 브라우저에서 직접 완료해 주세요. "
+            "완료 후 naver_blog_confirm_login으로 확인합니다."
+        ),
+        "awaiting_2fa": (
+            "2단계 인증 화면입니다. 사용자가 이 MCP 브라우저에서 인증을 마쳐야 합니다. "
+            "로그인 완료가 아닙니다."
+        ),
+        "awaiting_captcha": (
+            "캡차 화면입니다. 정답은 사용자가 입력합니다. 자동으로 통과시키지 않습니다."
+        ),
+        "credentials_not_entered": (
+            "로그인 칸에 값이 들어가지 않았습니다. 로그인 버튼을 누르지 않았습니다."
+        ),
+        "login_button_not_found": (
+            "로그인 버튼을 찾지 못했습니다. 한국어와 영어 화면의 버튼을 확인하세요."
+        ),
+        "ip_security_not_confirmed_off": (
+            "IP보안이 꺼진 것을 확인하지 못해 로그인 정보를 제출하지 않았습니다."
+        ),
+        "login_form_not_found": "로그인 폼을 찾지 못했습니다.",
+        "authenticated": (
+            "이 MCP 브라우저에 로그인 쿠키가 있습니다. "
+            "naver_blog_confirm_login으로 세션을 저장하세요."
+        ),
+    }
+    payload["success"] = status in {
+        "credentials_submitted",
+        "authenticated",
+    } or (submitted and status in {"awaiting_2fa", "awaiting_captcha"})
+    payload["message"] = messages.get(status, "로그인을 시작하지 못했습니다.")
+    return payload
 
 
 async def handle_confirm_login(
@@ -210,33 +251,63 @@ async def handle_confirm_login(
         작업 결과 딕셔너리
     """
     logger.info("로그인 확인 시작")
+    cancel_login_assist()
     try:
-        logged_in = await verify_login_session(page)
-        if not logged_in:
+        state = await inspect_login_state(page)
+        diagnostics = public_login_diagnostics(state)
+        diagnostics["configured_login_id"] = login_id()
+        diagnostics["configured_publish_blog_id"] = publish_blog_id()
+        if not state["logged_in"]:
             return {
                 "success": False,
                 "logged_in": False,
-                "message": (
-                    "아직 로그인 상태가 아닙니다. 브라우저 창에서 로그인/2차 인증을 "
-                    "완료한 뒤 다시 확인을 요청해 주세요."
-                ),
+                "status": state["status"],
+                "message": _confirm_message(state),
+                "diagnostics": diagnostics,
             }
 
         Path(storage_path).parent.mkdir(parents=True, exist_ok=True)
         await context.storage_state(path=storage_path)
-        logger.info(f"세션 저장 완료: {storage_path}")
+        logger.info("세션 저장 완료: %s", storage_path)
         return {
             "success": True,
             "logged_in": True,
-            "message": "로그인 확인 완료. 세션을 저장했습니다. 이제 글쓰기/조회 기능을 사용할 수 있습니다.",
+            "status": "authenticated",
+            "message": (
+                "이 MCP 브라우저에서 로그인을 확인했습니다. 세션 파일을 저장했습니다. "
+                f"발행 블로그 설정은 {publish_blog_id() or '(없음)'} 입니다."
+            ),
+            "diagnostics": diagnostics,
+            "configured_login_id": login_id(),
+            "configured_publish_blog_id": publish_blog_id(),
         }
-    except Exception as e:
-        logger.error(f"로그인 확인 중 오류: {e}", exc_info=True)
+    except Exception:
+        logger.error("로그인 확인 중 오류", exc_info=True)
         return {
             "success": False,
             "logged_in": False,
-            "message": f"로그인 확인 중 오류: {str(e)}",
+            "status": "unknown",
+            "message": "로그인 확인 중 오류가 발생했습니다. 저장된 세션 파일은 유지했습니다.",
         }
+
+
+def _confirm_message(state: dict) -> str:
+    status = state.get("status")
+    if status == "awaiting_2fa":
+        return (
+            "2단계 인증 화면입니다. 이 MCP 브라우저에서 사용자가 인증을 마칠 때까지 대기합니다. "
+            "로그인 성공으로 처리하지 않았고, 페이지는 이동하지 않았습니다."
+        )
+    if status == "awaiting_captcha":
+        return (
+            "보안 확인(캡차) 화면입니다. 정답은 사용자가 입력합니다. "
+            "로그인 성공으로 처리하지 않았고, 페이지는 이동하지 않았습니다."
+        )
+    return (
+        "이 MCP 브라우저 컨텍스트에는 네이버 로그인 쿠키가 없습니다. "
+        "다른 Chrome 창의 로그인과는 별개의 세션입니다. 페이지는 이동하지 않았고, "
+        "저장된 세션 파일은 지우지 않았습니다."
+    )
 
 
 @retry_on_error

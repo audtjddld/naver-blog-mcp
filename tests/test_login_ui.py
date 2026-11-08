@@ -49,6 +49,9 @@ class _Locator:
     async def text_content(self) -> str:
         return self._page.texts.get(self._selector, "")
 
+    async def get_attribute(self, name: str) -> str | None:
+        return self._page.attrs.get(self._selector, {}).get(name)
+
 
 class _Keyboard:
     def __init__(self, page: "FakePage") -> None:
@@ -80,8 +83,15 @@ class _Context:
 
 class FakePage:
     def __init__(self) -> None:
-        self.visible: dict[str, bool] = {"#id": True, "#pw": True}
+        self.visible: dict[str, bool] = {
+            "#id": True,
+            "#pw": True,
+            "label.switch_btn": True,
+        }
         self.values: dict[str, str] = {"#id": "", "#pw": ""}
+        self.attrs: dict[str, dict[str, str]] = {
+            "label.switch_btn": {"aria-checked": "false"}
+        }
         self.texts: dict[str, str] = {}
         self.cookies: list[dict] = []
         self.clicked: list[str] = []
@@ -218,8 +228,8 @@ async def test_other_naver_cookies_do_not_count_as_login() -> None:
     page.cookies = [{"name": "NNB", "domain": ".naver.com"}]
 
     assert await verify_login_session(page) is False
-    assert page.goto_calls[0]["url"].startswith("https://section.blog.naver.com")
-    assert page.goto_calls[0]["wait_until"] == "domcontentloaded"
+    assert page.goto_calls == []
+    assert page.url == "about:blank"
 
 
 @pytest.mark.asyncio

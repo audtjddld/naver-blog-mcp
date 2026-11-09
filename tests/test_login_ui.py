@@ -173,7 +173,7 @@ async def test_stealth_context_hides_webdriver() -> None:
 
 
 @pytest.mark.asyncio
-async def test_start_login_uses_domcontentloaded_and_current_button(
+async def test_start_login_waits_for_commit_and_current_button(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scheduled: dict = {}
@@ -196,7 +196,7 @@ async def test_start_login_uses_domcontentloaded_and_current_button(
     await start_login(page, "naver-id", "secret")
     await asyncio.sleep(0)
 
-    assert page.goto_calls[0]["wait_until"] == "domcontentloaded"
+    assert page.goto_calls[0]["wait_until"] == "commit"
     assert "networkidle" not in page.goto_calls[0]["wait_until"]
     assert "section.blog.naver.com" in page.goto_calls[0]["url"]
     assert page.wait_calls == ["#id"]
@@ -307,7 +307,7 @@ async def test_login_succeeds_from_cookies_without_opening_blog_home(
 
     assert result["success"] is True
     assert page.context.saved_path == str(storage)
-    assert page.goto_calls[0]["wait_until"] == "domcontentloaded"
+    assert page.goto_calls[0]["wait_until"] == "commit"
     assert all("nid.naver.com" in call["url"] for call in page.goto_calls)
     assert all(
         call["url"].rstrip("/") != "https://blog.naver.com" for call in page.goto_calls

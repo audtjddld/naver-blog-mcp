@@ -189,12 +189,46 @@ async def _switch_is_on(page: Page, selector: str) -> Optional[bool]:
     return None
 
 
+IP_SWITCH_INPUT = "#switchIP"
+IP_SWITCH_TOGGLE = "label[for='switchIP']"
+
+
+async def _ip_input_checked(page: Page) -> Optional[bool]:
+    """현재 NID 스위치는 aria-checked가 갱신되지 않아 checked 속성으로 읽는다."""
+    try:
+        return await page.locator(IP_SWITCH_INPUT).first.is_checked()
+    except Exception:
+        return None
+
+
 async def ensure_ip_security_off(page: Page) -> str:
     """Turn the login-form IP Security switch OFF before credentials.
 
     Returns already_off, turned_off, not_found, or still_on.
     Does not submit credentials. A missing or still-on switch must block submit.
     """
+    # 현재 NID 마크업: 숨겨진 <input id="switchIP" role="switch">와
+    # 이를 토글하는 <label for="switchIP">. input은 보이지 않으므로 존재만 본다.
+    try:
+        has_input = await page.locator(IP_SWITCH_INPUT).count() > 0
+    except Exception:
+        has_input = False
+    if has_input:
+        state = await _ip_input_checked(page)
+        if state is None:
+            return "not_found"
+        if state is False:
+            return "already_off"
+        try:
+            await page.locator(IP_SWITCH_TOGGLE).first.click()
+        except Exception:
+            logger.info("IP security switch could not be clicked")
+            return "still_on"
+        await _sleep(0.5)
+        if await _ip_input_checked(page) is False:
+            return "turned_off"
+        return "still_on"
+
     selector = None
     for candidate in _selector_list(NaverSelectors.LOGIN["ip_security_switch"]):
         if await _locator_visible(page, candidate):
@@ -278,7 +312,9 @@ async def inspect_login_state(page: Page) -> dict:
 
 async def _open_login_page(page: Page) -> None:
     # networkidle 은 nid 페이지에서 끝나지 않는다.
-    await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+    # url= 파라미터가 붙은 로그인 페이지는 DOMContentLoaded가 끝나지 않을 때가 있다.
+    # 응답 커밋만 기다리고 아이디 입력칸으로 준비 여부를 판단한다.
+    await page.goto(LOGIN_URL, wait_until="commit", timeout=30000)
     await page.wait_for_selector(LOGIN_ID_INPUT, timeout=15000)
     await _sleep(1)
 

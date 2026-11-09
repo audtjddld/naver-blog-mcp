@@ -35,6 +35,9 @@ class Config:
     BROWSER_ARGS: list[str] = [
         "--disable-blink-features=AutomationControlled",
         "--disable-dev-shm-usage",
+        # 이 환경에서는 nid.naver.com 정적 파일이 HTTP/2 연결에서 자주 끊겨
+        # 로그인 페이지 스크립트가 끝까지 로드되지 않는다.
+        "--disable-http2",
     ]
     BROWSER_IGNORE_DEFAULT_ARGS: list[str] = ["--enable-automation"]
 

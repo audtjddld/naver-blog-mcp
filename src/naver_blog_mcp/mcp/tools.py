@@ -10,7 +10,11 @@ from playwright.async_api import Page
 
 from pathlib import Path
 
-from ..automation.post_actions import create_blog_post, NaverBlogPostError
+from ..automation.post_actions import (
+    create_blog_post,
+    finalize_current_post,
+    NaverBlogPostError,
+)
 from ..automation.image_upload import upload_images
 from ..automation.category_actions import get_categories
 from ..automation.read_actions import list_posts, read_post
@@ -54,6 +58,33 @@ TOOLS_METADATA = {
             "type": "object",
             "properties": {},
             "required": [],
+        },
+    },
+    "naver_blog_finalize_post": {
+        "name": "naver_blog_finalize_post",
+        "description": (
+            "이미 열려 있는 글쓰기 편집기만 발행합니다. 새 글쓰기 페이지로 이동하지 않습니다. "
+            "편집기 제목이 title과 정확히 같고, visibility 공개범위를 선택했을 때만 최종 발행을 누릅니다. "
+            "success가 false이면 발행이 확인되지 않은 것이며, 글이 없다고 단정하지 않습니다."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "편집기에 이미 표시된 제목과 정확히 같아야 합니다.",
+                },
+                "visibility": {
+                    "type": "string",
+                    "enum": ["전체공개", "이웃공개", "서로이웃공개", "비공개"],
+                    "description": "발행 공개범위. 선택에 실패하면 최종 발행을 누르지 않습니다.",
+                },
+                "category": {
+                    "type": "string",
+                    "description": "선택할 카테고리. 지정했는데 찾지 못하면 발행하지 않습니다.",
+                },
+            },
+            "required": ["title", "visibility"],
         },
     },
     "naver_blog_create_post": {
@@ -517,6 +548,31 @@ async def handle_read_post(
             "content_text": "",
             "tags": [],
             "images": [],
+        }
+
+
+async def handle_finalize_post(
+    page: Page,
+    title: str,
+    visibility: str,
+    category: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Publish the already-open editor. Does not log the title or body."""
+    logger.info("열린 편집기 발행 확인")
+    try:
+        return await finalize_current_post(
+            page,
+            expected_title=title,
+            visibility=visibility,
+            category=category,
+        )
+    except Exception:
+        logger.error("편집기 발행 확인 중 오류", exc_info=True)
+        return {
+            "success": False,
+            "status": "publish_unconfirmed",
+            "message": "발행 확인 중 오류가 발생했습니다. 발행 여부는 확인되지 않았습니다.",
+            "post_url": None,
         }
 
 

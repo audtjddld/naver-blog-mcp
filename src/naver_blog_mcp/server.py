@@ -26,6 +26,7 @@ from .mcp.tools import (
     handle_read_post,
     handle_login,
     handle_confirm_login,
+    handle_finalize_post,
 )
 from .utils.trace_manager import trace_manager
 
@@ -92,7 +93,9 @@ class NaverBlogMCPServer:
         @self.server.call_tool()
         async def call_tool(name: str, arguments: dict) -> list[dict]:
             """Tool 호출 핸들러."""
-            logger.info(f"Tool called: {name} with arguments: {arguments}")
+            logger.info(
+                "Tool called: %s keys=%s", name, sorted((arguments or {}).keys())
+            )
 
             import json
 
@@ -142,7 +145,14 @@ class NaverBlogMCPServer:
                     await trace_manager.start_trace(self.context, name=name)
 
                 # Tool별 핸들러 호출
-                if name == "naver_blog_create_post":
+                if name == "naver_blog_finalize_post":
+                    result = await handle_finalize_post(
+                        page=page,
+                        title=arguments["title"],
+                        visibility=arguments["visibility"],
+                        category=arguments.get("category"),
+                    )
+                elif name == "naver_blog_create_post":
                     result = await handle_create_post(
                         page=page,
                         title=arguments["title"],

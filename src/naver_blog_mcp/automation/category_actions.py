@@ -2,19 +2,17 @@
 
 import logging
 import re
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 from playwright.async_api import Page
 
-from ..utils.exceptions import NaverBlogError
+from ..config import publish_blog_id
 from ..utils.error_handler import handle_playwright_error
+from .post_actions import resolved_blog_id
 
 logger = logging.getLogger(__name__)
 
 
-async def get_categories(
-    page: Page,
-    blog_id: Optional[str] = None
-) -> Dict[str, Any]:
+async def get_categories(page: Page, blog_id: Optional[str] = None) -> Dict[str, Any]:
     """네이버 블로그의 카테고리 목록을 가져옵니다.
 
     Args:
@@ -41,30 +39,20 @@ async def get_categories(
     try:
         logger.info("카테고리 목록 조회 시작")
 
-        # 1. 블로그 메인 페이지로 이동
-        # blog_id가 없으면 현재 페이지의 URL에서 추출하거나 config에서 가져오기
+        # section.blog.naver.com/BlogHome.naver 는 블로그 아이디가 아니다.
+        # 읽기 실패로 로그인을 다시 시작하지 않는다.
         if not blog_id:
-            # 현재 URL에서 blog_id 추출 시도
-            current_url = page.url
-            if "blog.naver.com" in current_url:
-                # URL에서 blogId 파라미터 찾기
-                match = re.search(r'blogId=([^&]+)', current_url)
-                if match:
-                    blog_id = match.group(1)
-                else:
-                    # URL 경로에서 blogId 추출 (예: /blogid/...)
-                    match = re.search(r'blog\.naver\.com/([^/?]+)', current_url)
-                    if match:
-                        extracted_id = match.group(1)
-                        # "PostList", "MyBlog" 등의 경로가 아닌 경우에만 blog_id로 사용
-                        if extracted_id not in ["PostList", "MyBlog", "PostView"]:
-                            blog_id = extracted_id
+            from ..config import config as app_config
 
-            # 여전히 blog_id가 없으면 config에서 가져오기
-            if not blog_id:
-                from ..config import config as app_config
-                blog_id = app_config.NAVER_BLOG_ID
-                logger.info(f"config에서 blog_id 가져옴: {blog_id}")
+            blog_id = resolved_blog_id(
+                page.url, publish_blog_id() or app_config.NAVER_BLOG_ID
+            )
+        if not blog_id:
+            return {
+                "success": False,
+                "message": "조회할 블로그 아이디를 정하지 못했습니다",
+                "categories": [],
+            }
 
         blog_url = f"https://blog.naver.com/{blog_id}"
         await page.goto(blog_url, wait_until="networkidle")
@@ -73,8 +61,7 @@ async def get_categories(
         # 2. iframe 접근
         try:
             iframe_element = await page.wait_for_selector(
-                "iframe#mainFrame",
-                timeout=10000
+                "iframe#mainFrame", timeout=10000
             )
             main_frame = await iframe_element.content_frame()
             logger.info("iframe#mainFrame 접근 성공")
@@ -83,22 +70,20 @@ async def get_categories(
             return {
                 "success": False,
                 "message": "블로그 페이지 구조를 찾을 수 없습니다",
-                "categories": []
+                "categories": [],
             }
 
         # 3. 카테고리 링크 찾기
         # PostList 링크는 카테고리 링크를 나타냄
         try:
-            category_links = await main_frame.query_selector_all(
-                "a[href*='PostList']"
-            )
+            category_links = await main_frame.query_selector_all("a[href*='PostList']")
             logger.info(f"PostList 링크 {len(category_links)}개 발견")
         except Exception as e:
             logger.error(f"카테고리 링크 조회 실패: {e}")
             return {
                 "success": False,
                 "message": f"카테고리 조회 중 오류 발생: {str(e)}",
-                "categories": []
+                "categories": [],
             }
 
         # 4. 카테고리 정보 추출
@@ -142,7 +127,7 @@ async def get_categories(
                 # URL에서 categoryNo 추출
                 category_no = None
                 if "categoryNo=" in href:
-                    match = re.search(r'categoryNo=(\d+)', href)
+                    match = re.search(r"categoryNo=(\d+)", href)
                     if match:
                         category_no = match.group(1)
 
@@ -160,7 +145,9 @@ async def get_categories(
 
                     category_info = {
                         "name": name,
-                        "url": href if href.startswith("http") else f"https://blog.naver.com{href}",
+                        "url": href
+                        if href.startswith("http")
+                        else f"https://blog.naver.com{href}",
                         "categoryNo": category_no,
                     }
                     categories.append(category_info)
@@ -178,15 +165,11 @@ async def get_categories(
             return {
                 "success": True,
                 "message": f"{len(categories)}개의 카테고리를 찾았습니다",
-                "categories": categories
+                "categories": categories,
             }
         else:
             logger.info("카테고리가 없습니다")
-            return {
-                "success": True,
-                "message": "카테고리가 없습니다",
-                "categories": []
-            }
+            return {"success": True, "message": "카테고리가 없습니다", "categories": []}
 
     except Exception as e:
         # Playwright 에러를 커스텀 에러로 변환
@@ -196,5 +179,5 @@ async def get_categories(
         return {
             "success": False,
             "message": f"카테고리 조회 중 오류 발생: {str(custom_error)}",
-            "categories": []
+            "categories": [],
         }

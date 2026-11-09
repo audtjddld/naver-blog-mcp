@@ -2,12 +2,13 @@
 
 import logging
 import re
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 from playwright.async_api import Page
 
-from ..config import config
+from ..config import config, publish_blog_id
 from ..utils.exceptions import NaverBlogError
 from ..utils.error_handler import handle_playwright_error
+from .post_actions import resolved_blog_id
 
 logger = logging.getLogger(__name__)
 
@@ -17,25 +18,14 @@ async def _get_blog_id(page: Page, blog_id: Optional[str] = None) -> str:
     if blog_id:
         return blog_id
 
-    current_url = page.url
-    if "blog.naver.com" in current_url:
-        match = re.search(r'blogId=([^&]+)', current_url)
-        if match:
-            return match.group(1)
-        match = re.search(r'blog\.naver\.com/([^/?]+)', current_url)
-        if match:
-            extracted_id = match.group(1)
-            if extracted_id not in ["PostList", "MyBlog", "PostView"]:
-                return extracted_id
-
-    return config.NAVER_BLOG_ID
+    # A read failure must not start a new login. section BlogHome is not an id.
+    found = resolved_blog_id(page.url, publish_blog_id() or config.NAVER_BLOG_ID)
+    return found or ""
 
 
 async def _access_main_frame(page: Page):
     """iframe#mainFrame에 접근합니다."""
-    iframe_element = await page.wait_for_selector(
-        "iframe#mainFrame", timeout=15000
-    )
+    iframe_element = await page.wait_for_selector("iframe#mainFrame", timeout=15000)
     main_frame = await iframe_element.content_frame()
     if not main_frame:
         raise NaverBlogError("mainFrame iframe에 접근할 수 없습니다")
@@ -96,9 +86,7 @@ async def list_posts(
 
             # 글 목록 테이블에서 제목 링크 추출
             # 리스트 뷰: table#listTopForm 안의 행들
-            post_rows = await main_frame.query_selector_all(
-                "table.blog2_list tr"
-            )
+            post_rows = await main_frame.query_selector_all("table.blog2_list tr")
 
             if not post_rows:
                 # 대체 셀렉터: 리스트 형태가 아닌 경우
@@ -126,7 +114,7 @@ async def list_posts(
                     title = title.strip()
 
                     # logNo 추출
-                    log_no_match = re.search(r'logNo=(\d+)', href)
+                    log_no_match = re.search(r"logNo=(\d+)", href)
                     if not log_no_match:
                         continue
                     log_no = log_no_match.group(1)
@@ -146,20 +134,22 @@ async def list_posts(
                     if cat_el:
                         cat_name = (await cat_el.text_content() or "").strip()
                         cat_href = await cat_el.get_attribute("href") or ""
-                        cat_match = re.search(r'categoryNo=(\d+)', cat_href)
+                        cat_match = re.search(r"categoryNo=(\d+)", cat_href)
                         if cat_match:
                             cat_no_val = cat_match.group(1)
 
                     post_url = f"https://blog.naver.com/{bid}/{log_no}"
 
-                    page_posts.append({
-                        "title": title,
-                        "logNo": log_no,
-                        "date": date_text,
-                        "categoryName": cat_name,
-                        "categoryNo": cat_no_val,
-                        "post_url": post_url,
-                    })
+                    page_posts.append(
+                        {
+                            "title": title,
+                            "logNo": log_no,
+                            "date": date_text,
+                            "categoryName": cat_name,
+                            "categoryNo": cat_no_val,
+                            "post_url": post_url,
+                        }
+                    )
 
                 except Exception as e:
                     logger.warning(f"글 정보 추출 중 오류: {e}")
@@ -174,10 +164,10 @@ async def list_posts(
                 for link in post_links:
                     try:
                         href = await link.get_attribute("href") or ""
-                        log_no_match = re.search(r'logNo=(\d+)', href)
+                        log_no_match = re.search(r"logNo=(\d+)", href)
                         if not log_no_match:
                             # /blogId/logNo 패턴
-                            log_no_match = re.search(rf'{bid}/(\d+)', href)
+                            log_no_match = re.search(rf"{bid}/(\d+)", href)
                         if not log_no_match:
                             continue
 
@@ -190,14 +180,16 @@ async def list_posts(
                         if not title or len(title) < 2:
                             continue
 
-                        page_posts.append({
-                            "title": title,
-                            "logNo": log_no,
-                            "date": "",
-                            "categoryName": "",
-                            "categoryNo": cat_no if cat_no != "0" else "",
-                            "post_url": f"https://blog.naver.com/{bid}/{log_no}",
-                        })
+                        page_posts.append(
+                            {
+                                "title": title,
+                                "logNo": log_no,
+                                "date": "",
+                                "categoryName": "",
+                                "categoryNo": cat_no if cat_no != "0" else "",
+                                "post_url": f"https://blog.naver.com/{bid}/{log_no}",
+                            }
+                        )
                     except Exception as e:
                         logger.warning(f"대체 추출 중 오류: {e}")
                         continue
@@ -210,9 +202,7 @@ async def list_posts(
             logger.info(f"페이지 {current_page}: {len(page_posts)}개 글 발견")
 
             # 다음 페이지 확인
-            next_link = await main_frame.query_selector(
-                "a.next, a:has-text('다음')"
-            )
+            next_link = await main_frame.query_selector("a.next, a:has-text('다음')")
             if not next_link:
                 break
 
@@ -330,7 +320,7 @@ async def read_post(
                 href = await el.get_attribute("href") or ""
                 # "전체보기" 등 제외
                 if text and text not in ["전체보기", ""] and "categoryNo=" in href:
-                    cat_match = re.search(r'categoryNo=(\d+)', href)
+                    cat_match = re.search(r"categoryNo=(\d+)", href)
                     if cat_match and cat_match.group(1) != "0":
                         category_name = text
                         break
@@ -366,7 +356,7 @@ async def read_post(
                 img_url = data_lazy or src
                 if img_url and "postfiles.pstatic.net" in img_url:
                     # 원본 크기 이미지 URL로 변환
-                    img_url = re.sub(r'\?type=.*$', '', img_url)
+                    img_url = re.sub(r"\?type=.*$", "", img_url)
                     if img_url not in images:
                         images.append(img_url)
 

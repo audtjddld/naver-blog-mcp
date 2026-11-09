@@ -2,7 +2,6 @@
 
 import os
 from pathlib import Path
-from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -36,6 +35,9 @@ class Config:
     BROWSER_ARGS: list[str] = [
         "--disable-blink-features=AutomationControlled",
         "--disable-dev-shm-usage",
+        # 이 환경에서는 nid.naver.com 정적 파일이 HTTP/2 연결에서 자주 끊겨
+        # 로그인 페이지 스크립트가 끝까지 로드되지 않는다.
+        "--disable-http2",
     ]
     BROWSER_IGNORE_DEFAULT_ARGS: list[str] = ["--enable-automation"]
 
@@ -50,9 +52,13 @@ class Config:
     @classmethod
     def validate(cls) -> None:
         """설정 유효성 검사."""
-        if not cls.NAVER_BLOG_ID:
-            raise ValueError("NAVER_BLOG_ID가 설정되지 않았습니다.")
-        if not cls.NAVER_BLOG_PASSWORD:
+        if not login_id():
+            raise ValueError("NAVER_LOGIN_ID 또는 NAVER_BLOG_ID가 설정되지 않았습니다.")
+        if not publish_blog_id():
+            raise ValueError(
+                "NAVER_PUBLISH_BLOG_ID 또는 NAVER_BLOG_ID가 설정되지 않았습니다."
+            )
+        if not (os.getenv("NAVER_BLOG_PASSWORD") or cls.NAVER_BLOG_PASSWORD):
             raise ValueError("NAVER_BLOG_PASSWORD가 설정되지 않았습니다.")
 
     @classmethod
@@ -89,3 +95,27 @@ def get_browser_config() -> dict:
 def get_context_config() -> dict:
     """Playwright 컨텍스트 설정을 반환합니다."""
     return config.get_context_config()
+
+
+def login_id() -> str:
+    """Naver account typed into the login form.
+
+    NAVER_BLOG_ID remains the fallback so an existing .env keeps working.
+    It is not the publish destination when NAVER_PUBLISH_BLOG_ID is set.
+    """
+    return (
+        os.getenv("NAVER_LOGIN_ID")
+        or os.getenv("NAVER_BLOG_ID")
+        or Config.NAVER_BLOG_ID
+        or ""
+    ).strip()
+
+
+def publish_blog_id() -> str:
+    """Blog id that may receive posts. Falls back to NAVER_BLOG_ID."""
+    return (
+        os.getenv("NAVER_PUBLISH_BLOG_ID")
+        or os.getenv("NAVER_BLOG_ID")
+        or Config.NAVER_BLOG_ID
+        or ""
+    ).strip()

@@ -49,6 +49,9 @@ class _Locator:
     async def text_content(self) -> str:
         return self._page.texts.get(self._selector, "")
 
+    async def get_attribute(self, name: str) -> str | None:
+        return self._page.attrs.get(self._selector, {}).get(name)
+
 
 class _Keyboard:
     def __init__(self, page: "FakePage") -> None:
@@ -80,8 +83,15 @@ class _Context:
 
 class FakePage:
     def __init__(self) -> None:
-        self.visible: dict[str, bool] = {"#id": True, "#pw": True}
+        self.visible: dict[str, bool] = {
+            "#id": True,
+            "#pw": True,
+            "label.switch_btn": True,
+        }
         self.values: dict[str, str] = {"#id": "", "#pw": ""}
+        self.attrs: dict[str, dict[str, str]] = {
+            "label.switch_btn": {"aria-checked": "false"}
+        }
         self.texts: dict[str, str] = {}
         self.cookies: list[dict] = []
         self.clicked: list[str] = []
@@ -163,7 +173,7 @@ async def test_stealth_context_hides_webdriver() -> None:
 
 
 @pytest.mark.asyncio
-async def test_start_login_uses_domcontentloaded_and_current_button(
+async def test_start_login_waits_for_commit_and_current_button(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scheduled: dict = {}
@@ -186,7 +196,7 @@ async def test_start_login_uses_domcontentloaded_and_current_button(
     await start_login(page, "naver-id", "secret")
     await asyncio.sleep(0)
 
-    assert page.goto_calls[0]["wait_until"] == "domcontentloaded"
+    assert page.goto_calls[0]["wait_until"] == "commit"
     assert "networkidle" not in page.goto_calls[0]["wait_until"]
     assert "section.blog.naver.com" in page.goto_calls[0]["url"]
     assert page.wait_calls == ["#id"]
@@ -218,8 +228,8 @@ async def test_other_naver_cookies_do_not_count_as_login() -> None:
     page.cookies = [{"name": "NNB", "domain": ".naver.com"}]
 
     assert await verify_login_session(page) is False
-    assert page.goto_calls[0]["url"].startswith("https://section.blog.naver.com")
-    assert page.goto_calls[0]["wait_until"] == "domcontentloaded"
+    assert page.goto_calls == []
+    assert page.url == "about:blank"
 
 
 @pytest.mark.asyncio
@@ -297,7 +307,7 @@ async def test_login_succeeds_from_cookies_without_opening_blog_home(
 
     assert result["success"] is True
     assert page.context.saved_path == str(storage)
-    assert page.goto_calls[0]["wait_until"] == "domcontentloaded"
+    assert page.goto_calls[0]["wait_until"] == "commit"
     assert all("nid.naver.com" in call["url"] for call in page.goto_calls)
     assert all(
         call["url"].rstrip("/") != "https://blog.naver.com" for call in page.goto_calls

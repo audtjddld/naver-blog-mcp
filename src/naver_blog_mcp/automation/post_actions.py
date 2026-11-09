@@ -3,6 +3,8 @@
 import asyncio
 import logging
 import re
+import time
+import urllib.parse
 import weakref
 from typing import Optional, Dict, Any
 
@@ -36,16 +38,129 @@ class NaverBlogPostError(Exception):
     pass
 
 
+class WrongBlogError(NaverBlogPostError):
+    """Editor URL belongs to a blog other than the configured publish target."""
+
+    pass
+
+
+_RESERVED_BLOG_PATHS = {
+    "postwrite",
+    "postlist",
+    "postview",
+    "myblog",
+    "bloghome.naver",
+    "postwriteform.naver",
+    "postlist.naver",
+    "redirect",
+}
+
+
+def blog_id_from_url(url: str) -> Optional[str]:
+    """Return the blog id in a blog.naver.com URL, if the path has one."""
+    if not url:
+        return None
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.netloc or "").lower()
+    # section.blog.naver.com contains the substring blog.naver.com, but its
+    # path (BlogHome.naver) is not a blog id.
+    if host != "blog.naver.com":
+        return None
+    query = urllib.parse.parse_qs(parsed.query)
+    for key in ("blogId", "blog_id"):
+        values = query.get(key) or []
+        if values and str(values[0]).strip():
+            return str(values[0]).strip()
+    parts = [part for part in parsed.path.split("/") if part]
+    if not parts:
+        return None
+    candidate = parts[0].strip()
+    lowered = candidate.lower()
+    if lowered in _RESERVED_BLOG_PATHS or lowered.endswith(".naver"):
+        return None
+    return candidate
+
+
+def is_editor_url(url: str) -> bool:
+    lowered = (url or "").lower()
+    return "postwrite" in lowered or "postwriteform" in lowered
+
+
+def published_post_url(
+    url: str, expected_blog_id: Optional[str] = None
+) -> Optional[str]:
+    """Return url only when it is a real post address for the expected blog.
+
+    https://blog.naver.com/{blog}/postwrite matches a loose blog glob and is
+    not a published post. section.blog.naver.com/BlogHome.naver is not either.
+    """
+    if not url or is_editor_url(url):
+        return None
+    parsed = urllib.parse.urlparse(url)
+    if (parsed.netloc or "").lower() != "blog.naver.com":
+        return None
+    query = urllib.parse.parse_qs(parsed.query)
+    blog = ""
+    log_no = ""
+    for key in ("blogId", "blog_id"):
+        values = query.get(key) or []
+        if values and str(values[0]).strip():
+            blog = str(values[0]).strip()
+            break
+    for key in ("logNo", "logno"):
+        values = query.get(key) or []
+        if values and str(values[0]).strip():
+            log_no = str(values[0]).strip()
+            break
+    parts = [part for part in parsed.path.split("/") if part]
+    if not blog and parts:
+        blog = parts[0].strip()
+    if not log_no and len(parts) >= 2:
+        log_no = parts[1].strip()
+    if (
+        not blog
+        or not log_no
+        or not log_no.isdigit()
+        or len(log_no) < 5
+        or blog.lower() in _RESERVED_BLOG_PATHS
+        or blog.lower().endswith(".naver")
+    ):
+        return None
+    if expected_blog_id and blog.lower() != expected_blog_id.lower():
+        return None
+    return url
+
+
+def resolved_blog_id(url: str, configured: Optional[str]) -> Optional[str]:
+    """Blog id for list/read. Ignore section BlogHome and other non-ids."""
+    found = blog_id_from_url(url)
+    if found:
+        return found
+    cleaned = (configured or "").strip()
+    return cleaned or None
+
+
+def _reject_mismatched_blog(url: str, expected: Optional[str]) -> None:
+    if not expected:
+        return
+    actual = blog_id_from_url(url)
+    if actual and actual.lower() != expected.lower():
+        raise WrongBlogError(
+            "글쓰기 페이지가 설정된 발행 블로그"
+            f"({expected})가 아닌 {actual} 입니다. 글을 쓰지 않았습니다."
+        )
+
+
 async def _sleep(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
 
 def _configured_blog_id() -> Optional[str]:
-    """로그인 아이디와 같은 블로그 아이디. 없으면 None."""
+    """Publish target. NAVER_PUBLISH_BLOG_ID, else NAVER_BLOG_ID."""
     try:
-        from ..config import config
+        from ..config import publish_blog_id
 
-        blog_id = (config.NAVER_BLOG_ID or "").strip()
+        blog_id = publish_blog_id()
     except Exception:
         return None
     return blog_id or None
@@ -234,6 +349,7 @@ async def navigate_to_post_write_page(
 
         current_url = page.url
         logger.info("글쓰기 페이지 URL: %s", current_url)
+        _reject_mismatched_blog(current_url, blog_id)
         if (
             "postwrite" in current_url.lower()
             or "PostWriteForm" in current_url
@@ -412,12 +528,77 @@ async def _select_visibility(page: Page, visibility: str) -> bool:
     return False
 
 
+FINAL_PUBLISH_SELECTORS = [
+    "[class*='layer_popup'] button:text-is('발행')",
+    "[class*='layer_publish'] button:text-is('발행')",
+    "button[class*='confirm']:text-is('발행')",
+    ".se-popup-button-confirm:text-is('발행')",
+]
+
+
+def _publish_state(
+    success: bool,
+    status: str,
+    message: str,
+    post_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "success": success,
+        "status": status,
+        "message": message,
+        "post_url": post_url,
+    }
+
+
+async def _click_final_publish(page: Page) -> bool:
+    """Click the confirm control in the publish dialog, not the toolbar."""
+    for frame in _frames_of(page):
+        for selector in FINAL_PUBLISH_SELECTORS:
+            try:
+                locator = frame.locator(selector)
+                if await locator.count() == 0:
+                    continue
+                await locator.first.click(force=True, timeout=5000)
+                logger.info("최종 발행 버튼 클릭: %s", selector)
+                return True
+            except Exception:
+                continue
+    return False
+
+
+async def _wait_for_published_url(
+    page: Page, expected_blog_id: Optional[str], timeout_ms: int
+) -> Optional[str]:
+    found = published_post_url(page.url, expected_blog_id)
+    if found:
+        return found
+    deadline = time.monotonic() + max(timeout_ms, 0) / 1000
+    while time.monotonic() < deadline:
+        await _sleep(0.2)
+        found = published_post_url(page.url, expected_blog_id)
+        if found:
+            return found
+    return None
+
+
+async def _editor_title(page: Page) -> str:
+    _frame, element, _selector = await find_visible(page, POST_WRITE_TITLE)
+    if element is None:
+        return ""
+    try:
+        text = await element.inner_text()
+    except Exception:
+        return ""
+    return " ".join((text or "").split())
+
+
 async def publish_post(
     page: Page,
     wait_for_completion: bool = True,
     timeout: int = 30000,
     category: Optional[str] = None,
     visibility: Optional[str] = None,
+    require_confirmed_settings: bool = False,
 ) -> Dict[str, Any]:
     """
     블로그 글을 발행합니다.
@@ -543,119 +724,123 @@ async def publish_post(
             raise NaverBlogPostError("발행 버튼을 찾을 수 없습니다.")
 
         # 2. 발행 설정(카테고리/공개범위) 적용
-        if publish_clicked:
-            await asyncio.sleep(1)  # 대화상자 로딩 대기
-
-            # 카테고리: best-effort (실패 시 기본 카테고리로 진행)
-            if category:
-                await _select_category(page, category)
-
-            # 공개범위: 비공개/이웃공개 등을 요청했는데 설정에 실패하면,
-            # 의도치 않은 '전체공개' 발행을 막기 위해 발행을 중단한다.
-            if visibility:
-                vis_ok = await _select_visibility(page, visibility)
-                if not vis_ok and visibility != "전체공개":
+        await asyncio.sleep(1)
+        if category:
+            category_ok = await _select_category(page, category)
+            if require_confirmed_settings and not category_ok:
+                return _publish_state(
+                    False,
+                    "category_not_set",
+                    "요청한 카테고리를 선택하지 못해 최종 발행을 누르지 않았습니다. "
+                    "발행 여부는 확인되지 않았습니다.",
+                )
+        if visibility:
+            vis_ok = await _select_visibility(page, visibility)
+            must_confirm = require_confirmed_settings or visibility != "전체공개"
+            if not vis_ok and must_confirm:
+                try:
                     await page.screenshot(path="playwright-state/error_visibility.png")
-                    raise NaverBlogPostError(
-                        f"공개범위 '{visibility}' 설정에 실패하여 발행을 중단했습니다. "
-                        "(의도치 않은 전체공개 방지 — 셀렉터 튜닝 필요)"
-                    )
+                except Exception:
+                    pass
+                return _publish_state(
+                    False,
+                    "visibility_not_set",
+                    f"공개범위 '{visibility}'를 선택하지 못해 최종 발행을 누르지 않았습니다. "
+                    "발행 여부는 확인되지 않았습니다.",
+                )
 
-        # 3. 발행 설정 대화상자에서 최종 "발행" 버튼 클릭
-        if publish_clicked:
-            try:
-                # 대화상자 내 발행 버튼을 force=True로 클릭 시도
-                final_publish_clicked = False
-                for idx, frame in enumerate(page.frames):
-                    try:
-                        dialog_publish_selectors = [
-                            ".layer_popup__i0QOY button[class*='confirm']:has-text('발행')",
-                            ".layer_popup__i0QOY button:has-text('발행')",
-                        ]
+        final_clicked = await _click_final_publish(page)
+        if not final_clicked:
+            return _publish_state(
+                False,
+                "final_click_missing",
+                "발행 설정 창의 최종 발행 버튼을 누르지 못했습니다. "
+                "서버 반영 여부는 확인되지 않았습니다. 새 글은 만들지 않았습니다.",
+            )
 
-                        for selector in dialog_publish_selectors:
-                            try:
-                                btn_count = await frame.locator(selector).count()
-                                if btn_count > 0:
-                                    await frame.locator(selector).first.click(
-                                        force=True, timeout=5000
-                                    )
-                                    final_publish_clicked = True
-                                    await asyncio.sleep(2)
-                                    break
-                            except Exception:
-                                continue
+        if not wait_for_completion:
+            return _publish_state(
+                False,
+                "publish_unconfirmed",
+                "최종 발행 버튼은 눌렸지만 글 주소 확인을 기다리지 않았습니다. "
+                "발행 여부는 확인되지 않았습니다.",
+            )
 
-                        if final_publish_clicked:
-                            break
-                    except Exception:
-                        continue
+        post_url = await _wait_for_published_url(page, _configured_blog_id(), timeout)
+        if post_url:
+            logger.info("발행 주소 확인")
+            return _publish_state(
+                True,
+                "published",
+                "글 주소로 이동해 발행을 확인했습니다.",
+                post_url,
+            )
+        return _publish_state(
+            False,
+            "publish_unconfirmed",
+            "최종 발행 버튼은 눌렸지만 글 주소로 이동하지 않았습니다. "
+            "발행 여부는 확인되지 않았습니다. 같은 편집기에서 다시 확인하세요.",
+        )
 
-                # JavaScript로 대화상자 내 발행 버튼 클릭 (fallback)
-                if not final_publish_clicked:
-                    for frame in page.frames:
-                        try:
-                            result = await frame.evaluate(
-                                """
-                                () => {
-                                    const popup = document.querySelector('.layer_popup__i0QOY.is_show__TMSLq');
-                                    if (!popup) return 'No popup';
-
-                                    const buttons = popup.querySelectorAll('button');
-                                    for (let btn of buttons) {
-                                        if ((btn.textContent || '').trim() === '발행') {
-                                            btn.click();
-                                            return 'Clicked';
-                                        }
-                                    }
-                                    return 'No button';
-                                }
-                            """
-                            )
-                            if "Clicked" in result:
-                                await asyncio.sleep(3)
-                                break
-                        except Exception:
-                            continue
-
-            except Exception:
-                pass
-
-        # 3. 발행 완료 대기 (옵션)
-        if wait_for_completion:
-            try:
-                # 발행 후 글 보기 페이지로 리다이렉트되는지 확인
-                # URL 패턴: https://blog.naver.com/{blog_id}/{post_id}
-                await page.wait_for_url("**/blog.naver.com/*/**", timeout=timeout)
-                post_url = page.url
-
-                # PostView 페이지인지 확인 (본문 영역이 있는지)
-                # 글쓰기 페이지가 아닌 글 보기 페이지인지 체크
-                if (
-                    "postwrite" not in post_url.lower()
-                    and "redirect=write" not in post_url.lower()
-                ):
-                    # URL이 {blog_id}/{post_id} 형태인지 확인
-                    logger.info(f"발행 완료: {post_url}")
-                    return {
-                        "success": True,
-                        "message": "글이 성공적으로 발행되었습니다.",
-                        "post_url": post_url,
-                    }
-                else:
-                    raise NaverBlogPostError("발행 후 페이지 이동에 실패했습니다.")
-
-            except PlaywrightTimeout:
-                raise NaverBlogPostError("발행 완료 대기 시간 초과")
-        else:
-            return {
-                "success": True,
-                "message": "발행 요청을 전송했습니다.",
-                "post_url": None,
-            }
-
+    except NaverBlogPostError:
+        raise
     except Exception as e:
-        raise NaverBlogPostError(f"발행 중 오류: {str(e)}")
+        raise NaverBlogPostError(f"발행 중 오류: {type(e).__name__}")
+
+
+async def finalize_current_post(
+    page: Page,
+    expected_title: str,
+    visibility: str,
+    category: Optional[str] = None,
+    timeout: int = 30000,
+) -> Dict[str, Any]:
+    """Publish the editor that is already open. Never opens a new post."""
+    if not is_editor_url(getattr(page, "url", "") or ""):
+        return _publish_state(
+            False,
+            "not_on_editor",
+            "현재 페이지가 글쓰기 편집기가 아닙니다. 새 글을 만들지 않았습니다.",
+        )
+
+    expected_blog = _configured_blog_id()
+    actual_blog = blog_id_from_url(page.url)
+    if expected_blog and actual_blog and actual_blog.lower() != expected_blog.lower():
+        return _publish_state(
+            False,
+            "wrong_blog",
+            f"편집기 블로그가 설정된 발행 블로그({expected_blog})와 다릅니다. "
+            "발행하지 않았습니다.",
+        )
+
+    expected = " ".join((expected_title or "").split())
+    if not expected:
+        return _publish_state(
+            False,
+            "title_mismatch",
+            "비교할 제목이 없습니다. 발행하지 않았습니다.",
+        )
+    current = await _editor_title(page)
+    if current != expected:
+        return _publish_state(
+            False,
+            "title_mismatch",
+            "편집기에 열린 제목이 요청한 제목과 다릅니다. 발행하지 않았습니다.",
+        )
+    if not visibility:
+        return _publish_state(
+            False,
+            "visibility_required",
+            "공개범위를 지정해야 발행합니다. 발행하지 않았습니다.",
+        )
+    return await publish_post(
+        page,
+        wait_for_completion=True,
+        timeout=timeout,
+        category=category,
+        visibility=visibility,
+        require_confirmed_settings=True,
+    )
 
 
 async def create_blog_post(
